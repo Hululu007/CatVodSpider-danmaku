@@ -27,6 +27,7 @@ public class DanmakuSpider extends Spider {
     private static boolean initialized = false;
     private static File sCacheDir = null;
     private static WebServer webServer;
+    private static volatile String pendingExtend = "";
 
     // 日志
     private static final List<String> logBuffer = new CopyOnWriteArrayList<>();
@@ -40,7 +41,7 @@ public class DanmakuSpider extends Spider {
     @Override
     public void init(Context context, String extend) throws Exception {
         super.init(context, extend);
-        doInitWork(context, extend);
+        if (!TextUtils.isEmpty(extend)) pendingExtend = extend;
     }
 
     public static void clearCache(Context context) {
@@ -56,38 +57,45 @@ public class DanmakuSpider extends Spider {
     }
 
     public static synchronized void doInitWork(Context context, String extend) {
+        String effectiveExtend = TextUtils.isEmpty(extend) ? pendingExtend : extend;
+
         // 初始化缓存目录
         sCacheDir = new File(context.getCacheDir(), "leo_danmaku_cache");
         if (!sCacheDir.exists()) sCacheDir.mkdirs();
 
         // 初始化配置
         DanmakuConfig config = DanmakuConfigManager.loadConfig(context);
-        if (!TextUtils.isEmpty(extend)) {
-            if (extend.startsWith("http")) {
-                config.getApiUrls().addAll(Arrays.asList(extend.split(",")));
-            } else if (extend.startsWith("{") && extend.endsWith("}")) {
+        if (!TextUtils.isEmpty(effectiveExtend)) {
+            if (effectiveExtend.startsWith("http")) {
+                config.getApiUrls().addAll(Arrays.asList(effectiveExtend.split(",")));
+            } else if (effectiveExtend.startsWith("{") && effectiveExtend.endsWith("}")) {
                 try {
-                    JSONObject jsonObject = new JSONObject(extend);
+                    JSONObject jsonObject = new JSONObject(effectiveExtend);
                     config.updateFromJson(jsonObject);
                 } catch (Exception e) {
                     log("解析JSON格式配置失败: " + e.getMessage());
                 }
             }
+            pendingExtend = "";
         }
 
         DanmakuConfigManager.saveConfig(context, config);
 
         if (initialized) return;
 
-        // 启动WebServer
+        ensureWebServerStarted(context);
+
+        log("Leo弹幕插件 v1.0 初始化完成");
+        initialized = true;
+    }
+
+    private static synchronized void ensureWebServerStarted(Context context) {
+        if (webServer != null || context == null) return;
         try {
             webServer = new WebServer(9810);
         } catch (IOException e) {
             e.printStackTrace();
         }
-
-        log("Leo弹幕插件 v1.0 初始化完成");
-        initialized = true;
     }
 
     // 重置自动搜索状态
@@ -96,14 +104,17 @@ public class DanmakuSpider extends Spider {
     }
 
     public static String getAutoSettingsUrl() {
+        ensureWebServerStarted(Init.context());
         return webServer == null ? "" : webServer.getAutoSettingsUrl();
     }
 
     public static String getApiSettingsUrl() {
+        ensureWebServerStarted(Init.context());
         return webServer == null ? "" : webServer.getApiSettingsUrl();
     }
 
     public static String getTmdbSettingsUrl() {
+        ensureWebServerStarted(Init.context());
         return webServer == null ? "" : webServer.getTmdbSettingsUrl();
     }
 
@@ -188,11 +199,14 @@ public class DanmakuSpider extends Spider {
             return result.toString();
         } catch (Exception e) {
             return "";
+        } finally {
+            Init.scheduleAfterHomeBootstrap();
         }
     }
 
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
+        Init.startBackgroundServicesNow();
         try {
             DanmakuConfig config = DanmakuConfigManager.getConfig(Objects.requireNonNull(Utils.getTopActivity()));
             JSONObject result = new JSONObject();
@@ -255,6 +269,7 @@ public class DanmakuSpider extends Spider {
 
     @Override
     public String detailContent(List<String> ids) {
+        Init.startBackgroundServicesNow();
         if (ids == null || ids.isEmpty()) return "";
         final String id = ids.get(0);
 
@@ -419,6 +434,7 @@ public class DanmakuSpider extends Spider {
 
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) {
+        Init.startBackgroundServicesNow();
         return "";
     }
 

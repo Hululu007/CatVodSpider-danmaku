@@ -13,22 +13,28 @@ import org.json.JSONObject;
 
 import java.net.URLEncoder;
 import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Auto 去片头尾：TMDB 负责解析剧集，IntroDB/AniSkip 负责提供时间点。
+ * Auto 去片头尾：TMDB 识别剧集，IntroDB 优先，TheIntroDB 补缺，动漫另补 AniSkip。
  */
 public final class AutoSkipService {
 
     private static final String PREFS_NAME = "danmaku_auto_skip_cache_v5";
+    private static final String EPISODE_TITLE_CACHE_PREFIX = "epname_";
     private static final String TMDB_BASE = "https://api.themoviedb.org/3";
     private static final String TMDB_FALLBACK_BASE = "https://api.tmdb.org/3";
     private static final String INTRODB_SEGMENTS = "https://api.introdb.app/segments";
+    private static final String THEINTRODB_MEDIA = "https://api.theintrodb.org/v4/media";
+    private static final int SEGMENT_CACHE_VERSION = 7;
     private static final String ANILIST_URL = "https://graphql.anilist.co";
     private static final String ANISKIP_BASE = "https://api.aniskip.com/v2/skip-times/";
     private static final long SUCCESS_TTL_MS = 7L * 24 * 60 * 60 * 1000;
@@ -43,7 +49,10 @@ public final class AutoSkipService {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Set<String> IN_FLIGHT =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private static final Map<String, Candidate> EPISODE_TITLE_CANDIDATE_CACHE =
+            new ConcurrentHashMap<>();
     private static volatile long lastCachePruneAt;
+    private static volatile long theIntroDbRetryAt;
 
     public static class Markers {
         public long introStartMs = -1;
@@ -52,6 +61,11 @@ public final class AutoSkipService {
         public long recapStartMs = -1;
         public long recapEndMs = -1;
         public String imdbId = "";
+        public long tmdbId;
+        public boolean movie;
+        public long durationMs;
+        public boolean sourcesComplete = true;
+        public List<SkipSegmentSources.Segment> segments = new ArrayList<>();
         public String tmdbTitle = "";
         public String source = "";
         public String error = "";
@@ -69,7 +83,7 @@ public final class AutoSkipService {
         }
 
         public boolean hasAny() {
-            return hasIntro() || hasOutro() || hasRecap();
+            return hasIntro() || hasOutro() || hasRecap() || !segments.isEmpty();
         }
     }
 
@@ -85,6 +99,24 @@ public final class AutoSkipService {
         String date;
         boolean animation;
         boolean exact;
+    }
+
+    public static class EpisodeTitleMetadata {
+        public final boolean episodic;
+        public final boolean animation;
+        public final String title;
+        public final long tmdbId;
+
+        EpisodeTitleMetadata(boolean episodic, boolean animation, String title) {
+            this(episodic, animation, title, 0);
+        }
+
+        EpisodeTitleMetadata(boolean episodic, boolean animation, String title, long tmdbId) {
+            this.episodic = episodic;
+            this.animation = animation;
+            this.title = title == null ? "" : title;
+            this.tmdbId = tmdbId;
+        }
     }
 
     private AutoSkipService() {
@@ -110,6 +142,7 @@ public final class AutoSkipService {
                 }
             } catch (Throwable e) {
                 result = new Markers();
+                result.sourcesComplete = false;
                 result.error = "自动片头查询异常: " + safeMessage(e);
                 DanmakuSpider.log(result.error);
             } finally {
@@ -136,7 +169,9 @@ public final class AutoSkipService {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = null;
         for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
-            if (!entry.getKey().startsWith("seg_") || !(entry.getValue() instanceof String)) continue;
+            if ((!entry.getKey().startsWith("seg_")
+                    && !entry.getKey().startsWith(EPISODE_TITLE_CACHE_PREFIX))
+                    || !(entry.getValue() instanceof String)) continue;
             try {
                 JSONObject json = new JSONObject((String) entry.getValue());
                 if (json.optLong("expires", 0) <= now) {
@@ -184,9 +219,170 @@ public final class AutoSkipService {
         }
     }
 
+    public static EpisodeTitleMetadata fetchEpisodeTitleMetadata(
+            Context context, String title, int season, int episode) {
+        if (context == null || TextUtils.isEmpty(title) || season < 0 || episode <= 0) {
+            return null;
+        }
+        DanmakuConfig config = DanmakuConfigManager.getConfig(context);
+        String apiKey = config.getTmdbApiKey();
+        String language = config.getTmdbLanguage();
+        if (!isValidKey(apiKey)) return null;
+
+        Candidate candidate = resolveEpisodeTitleCandidate(title, apiKey, language);
+        if (candidate == null || candidate.id <= 0) return null;
+        if (!"tv".equals(candidate.mediaType)) {
+            return new EpisodeTitleMetadata(false, false, "");
+        }
+
+        String cached = readEpisodeTitleCache(
+                context, candidate.id, season, episode, language);
+        if (cached != null) {
+            return new EpisodeTitleMetadata(true, candidate.animation, cached, candidate.id);
+        }
+        if ("en-US".equalsIgnoreCase(language)) {
+            return new EpisodeTitleMetadata(true, candidate.animation, "", candidate.id);
+        }
+
+        String result = fetchAndCacheEpisodeTitle(
+                context, candidate, season, episode, apiKey, language);
+        if (TextUtils.isEmpty(result) && !"en-US".equalsIgnoreCase(language)) {
+            result = fetchAndCacheEpisodeTitle(
+                    context, candidate, season, episode, apiKey, "en-US");
+        }
+        return new EpisodeTitleMetadata(true, candidate.animation, result, candidate.id);
+    }
+
+    static JSONArray fetchSeriesLogoImages(Context context, long tmdbId) throws Exception {
+        if (context == null || tmdbId <= 0) return null;
+        String apiKey = DanmakuConfigManager.getConfig(context).getTmdbApiKey();
+        if (!isValidKey(apiKey)) return null;
+        String body = tmdbGet("/tv/" + tmdbId + "/images", apiKey, "include_image_language=zh");
+        JSONObject json = new JSONObject(body);
+        if (!json.has("logos")) return null;
+        return json.getJSONArray("logos");
+    }
+
+    private static Candidate resolveEpisodeTitleCandidate(
+            String title, String apiKey, String language) {
+        String cacheKey = normalizeForCompare(title) + "|" + language;
+        Candidate cached = EPISODE_TITLE_CANDIDATE_CACHE.get(cacheKey);
+        if (cached != null) return cached;
+
+        Candidate tv = searchTmdbType(title, apiKey, language, "tv");
+        Candidate movie = searchTmdbType(title, apiKey, language, "movie");
+        Candidate candidate;
+        if (movie != null && movie.exact && (tv == null || !tv.exact)) {
+            candidate = movie;
+        } else if (tv != null) {
+            candidate = tv;
+        } else {
+            candidate = movie;
+        }
+        if (candidate != null) {
+            EPISODE_TITLE_CANDIDATE_CACHE.put(cacheKey, candidate);
+        }
+        return candidate;
+    }
+
+    public static String fetchEpisodeTitle(Context context, String title,
+                                           int season, int episode) {
+        EpisodeTitleMetadata metadata = fetchEpisodeTitleMetadata(
+                context, title, season, episode);
+        return metadata == null || !metadata.episodic ? "" : metadata.title;
+    }
+
+    private static String fetchAndCacheEpisodeTitle(Context context, Candidate candidate,
+                                                     int season, int episode,
+                                                     String apiKey, String language) {
+        try {
+            String body = tmdbGet("/tv/" + candidate.id + "/season/" + season,
+                    apiKey, "language=" + encode(language));
+            if (TextUtils.isEmpty(body)) return "";
+
+            JSONArray episodes = new JSONObject(body).optJSONArray("episodes");
+            if (episodes == null) return "";
+            String currentTitle = "";
+            for (int i = 0; i < episodes.length(); i++) {
+                JSONObject item = episodes.optJSONObject(i);
+                if (item == null) continue;
+                int number = item.optInt("episode_number", 0);
+                if (number <= 0) continue;
+                String name = item.optString("name", "").trim();
+                if ("null".equalsIgnoreCase(name)) name = "";
+                if (isPlaceholderEpisodeName(name)) name = "";
+                if (number == episode) currentTitle = name;
+                writeEpisodeTitleCache(context, candidate.id, season, number, language, name);
+            }
+            if (TextUtils.isEmpty(currentTitle)) {
+                writeEpisodeTitleCache(context, candidate.id, season, episode, language, "");
+            }
+            return currentTitle;
+        } catch (Exception e) {
+            DanmakuSpider.log("TMDB 集标题查询失败: " + safeMessage(e));
+            writeEpisodeTitleCache(context, candidate.id, season, episode, language, "");
+            return "";
+        }
+    }
+
+    private static String readEpisodeTitleCache(Context context, long tmdbId,
+                                                int season, int episode, String language) {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String key = episodeTitleCacheKey(tmdbId, season, episode, language);
+        String raw = prefs.getString(key, null);
+        if (TextUtils.isEmpty(raw)) return null;
+        try {
+            JSONObject json = new JSONObject(raw);
+            if (json.optLong("expires", 0) <= System.currentTimeMillis()) {
+                prefs.edit().remove(key).apply();
+                return null;
+            }
+            String cachedName = json.optString("name", "");
+            if (isPlaceholderEpisodeName(cachedName)) {
+                prefs.edit().remove(key).apply();
+                return null;
+            }
+            return cachedName;
+        } catch (Exception e) {
+            prefs.edit().remove(key).apply();
+            return null;
+        }
+    }
+
+    private static void writeEpisodeTitleCache(Context context, long tmdbId, int season,
+                                               int episode, String language, String title) {
+        if (context == null || episode <= 0) return;
+        try {
+            long ttl = TextUtils.isEmpty(title) ? FAILURE_TTL_MS : SUCCESS_TTL_MS;
+            JSONObject json = new JSONObject()
+                    .put("expires", System.currentTimeMillis() + ttl)
+                    .put("name", title == null ? "" : title);
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(episodeTitleCacheKey(tmdbId, season, episode, language),
+                            json.toString())
+                    .apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static boolean isPlaceholderEpisodeName(String name) {
+        if (TextUtils.isEmpty(name)) return false;
+        String compact = name.replaceAll("\\s+", "");
+        if (compact.matches("第\\d+[集话期]")) return true;
+        return compact.matches("(?i)(?:episode|ep|e)\\d+");
+    }
+
+    private static String episodeTitleCacheKey(long tmdbId, int season,
+                                               int episode, String language) {
+        return EPISODE_TITLE_CACHE_PREFIX + tmdbId + "_" + season + "_" + episode
+                + "_" + Integer.toHexString((language == null ? "" : language).hashCode());
+    }
+
     private static Markers fetch(Context context, ChapterManager.MediaInfo media,
                                  String apiKey, String language) {
         Markers result = new Markers();
+        result.sourcesComplete = false;
         if (!isValidKey(apiKey)) {
             result.error = "TMDB Key 未配置或格式错误";
             return result;
@@ -210,6 +406,9 @@ public final class AutoSkipService {
             return result;
         }
         result.tmdbTitle = candidate.title;
+        result.tmdbId = candidate.id;
+        result.movie = "movie".equals(candidate.mediaType);
+        result.durationMs = media.durationMs;
 
         String imdbId = getImdbId(candidate, apiKey);
         result.imdbId = imdbId;
@@ -220,12 +419,7 @@ public final class AutoSkipService {
                 return result;
             }
         }
-        if (!TextUtils.isEmpty(imdbId)) {
-            readIntroDb(result, imdbId, season, episode, "movie".equals(candidate.mediaType));
-        }
-        if (!result.hasAny() && !"movie".equals(candidate.mediaType)) {
-            readAniSkip(result, title, season, episode, media.durationMs);
-        }
+        readSegmentSources(result, title, season, episode, media.durationMs);
         if (!result.hasAny()) {
             if (!TextUtils.isEmpty(result.error)) return result;
             result.error = "没有可用的片头片尾数据";
@@ -236,7 +430,7 @@ public final class AutoSkipService {
     private static void schedulePrefetch(Context context, ChapterManager.MediaInfo media,
                                          DanmakuConfig config, Markers current) {
         if (context == null || media == null || config == null || current == null
-                || TextUtils.isEmpty(current.imdbId)) return;
+                || (TextUtils.isEmpty(current.imdbId) && current.tmdbId <= 0) || current.movie) return;
         if (!config.isAutoSkipEnabled()) return;
 
         MediaIdentityResolver.Identity identity = MediaIdentityResolver.resolve(
@@ -250,7 +444,8 @@ public final class AutoSkipService {
         for (int offset = 1; offset <= PRELOAD_AHEAD; offset++) {
             final int episode = currentEpisode + offset;
             final String titleForTask = title;
-            String cacheKey = makeCacheKey(title, season, episode);
+            // The next episode's duration is unknown; do not reuse this episode's cut selection.
+            String cacheKey = makeCacheKey(title, season, episode, 0);
             if (TextUtils.isEmpty(cacheKey) || readCache(context, cacheKey) != null) continue;
             if (!IN_FLIGHT.add(cacheKey)) continue;
             EXECUTOR.execute(() -> {
@@ -258,11 +453,9 @@ public final class AutoSkipService {
                     if (readCache(context, cacheKey) != null) return;
                     Markers prefetched = new Markers();
                     prefetched.imdbId = current.imdbId;
+                    prefetched.tmdbId = current.tmdbId;
                     prefetched.tmdbTitle = current.tmdbTitle;
-                    readIntroDb(prefetched, current.imdbId, season, episode, false);
-                    if (!prefetched.hasAny()) {
-                        readAniSkip(prefetched, titleForTask, season, episode, media.durationMs);
-                    }
+                    readSegmentSources(prefetched, titleForTask, season, episode, 0);
                     if (!prefetched.hasAny() && TextUtils.isEmpty(prefetched.error)) {
                         prefetched.error = "预加载无可用数据";
                     }
@@ -368,66 +561,63 @@ public final class AutoSkipService {
         }
     }
 
-    private static void readIntroDb(Markers result, String imdbId, int season,
-                                    int episode, boolean movie) {
-        StringBuilder url = new StringBuilder(INTRODB_SEGMENTS)
-                .append("?imdb_id=").append(encode(imdbId));
-        if (movie) {
-            url.append("&is_movie=true");
-        } else {
-            url.append("&season=").append(Math.max(1, season))
-                    .append("&episode=").append(Math.max(1, episode))
-                    .append("&is_movie=false");
+    private static void readSegmentSources(Markers result, String title, int season, int episode, long durationMs) {
+        result.sourcesComplete = true;
+        if (!TextUtils.isEmpty(result.imdbId)) {
+            String url = INTRODB_SEGMENTS + "?imdb_id=" + encode(result.imdbId)
+                    + (result.movie ? "&is_movie=true" : "&season=" + Math.max(0, season)
+                    + "&episode=" + Math.max(1, episode) + "&is_movie=false");
+            JSONObject json = segmentGet(url, false);
+            if (json == null) result.sourcesComplete = false;
+            if (json != null) SkipSegmentSources.merge(result, SkipSegmentSources.introDb(json, durationMs), durationMs);
         }
-        Exception lastError = null;
-        for (int attempt = 0; attempt < 2; attempt++) {
-            try {
-                JSONObject json = new JSONObject(OkHttp.string(url.toString(), 12000));
-                JSONObject intro = json.optJSONObject("intro");
-                JSONObject outro = json.optJSONObject("outro");
-                JSONObject recap = json.optJSONObject("recap");
-                if (intro == null && outro == null && recap == null && attempt == 0) {
-                    Thread.sleep(300);
-                    continue;
-                }
-                applySegment(result, intro, "IntroDB", "intro");
-                applySegment(result, recap, "IntroDB", "recap");
-                if (outro != null) {
-                    long start = outro.optLong("start_ms", -1);
-                    if (start > 0) result.outroStartMs = start;
-                    if (start > 0) result.source = "IntroDB";
-                }
-                return;
-            } catch (Exception e) {
-                lastError = e;
-                try {
-                    Thread.sleep(250);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+        if (result.tmdbId > 0 || !TextUtils.isEmpty(result.imdbId)) {
+            JSONObject json = segmentGet(theIntroDbUrl(result, season, episode, durationMs), true);
+            if (json == null) result.sourcesComplete = false;
+            if (json != null) SkipSegmentSources.merge(result,
+                    SkipSegmentSources.theIntroDb(json, durationMs, Math.max(0, season), Math.max(1, episode), result.movie),
+                    durationMs);
         }
-        result.error = "IntroDB 请求失败: " + safeMessage(lastError);
+        if (!result.movie && !result.hasIntro() && !result.hasOutro()) {
+            readAniSkip(result, title, season, episode, durationMs);
+        }
+        if (result.hasAny()) result.error = "";
     }
 
-    private static void applySegment(Markers result, JSONObject segment,
-                                     String source, String type) {
-        if (segment == null) return;
-        long start = segment.optLong("start_ms", -1);
-        long end = segment.optLong("end_ms", -1);
-        if (start < 0) return;
-        if ("intro".equals(type)) {
-            if (end <= start) return;
-            result.introStartMs = start;
-            result.introEndMs = end;
-        } else if ("recap".equals(type)) {
-            result.recapStartMs = start;
-            result.recapEndMs = end > start ? end : -1;
-        } else {
-            return;
+    static String theIntroDbUrl(Markers result, int season, int episode, long durationMs) {
+        StringBuilder url = new StringBuilder(THEINTRODB_MEDIA);
+        if (result.tmdbId > 0) url.append("?tmdb_id=").append(result.tmdbId);
+        else url.append("?imdb_id=").append(encode(result.imdbId));
+        if (!result.movie) url.append("&season=").append(Math.max(0, season))
+                .append("&episode=").append(Math.max(1, episode));
+        if (durationMs > 0) url.append("&duration_ms=").append(durationMs);
+        return url.append("&details=true&merge_unknown=false").toString();
+    }
+
+    private static JSONObject segmentGet(String url, boolean theIntroDb) {
+        if (theIntroDb && System.currentTimeMillis() < theIntroDbRetryAt) return null;
+        try (okhttp3.Response response = OkHttp.client().newBuilder().callTimeout(8, TimeUnit.SECONDS).build()
+                .newCall(new okhttp3.Request.Builder().url(url).header("Accept", "application/json").build()).execute()) {
+            if (response.code() == 429 && theIntroDb) {
+                long seconds = 60;
+                try { seconds = Long.parseLong(response.header("Retry-After", "60")); } catch (Exception ignored) {}
+                if (response.body() != null) {
+                    try { seconds = new JSONObject(response.body().string()).optLong("retry_after_seconds", seconds); }
+                    catch (Exception ignored) {}
+                }
+                theIntroDbRetryAt = System.currentTimeMillis() + Math.max(10, Math.min(seconds, 86400)) * 1000;
+                DanmakuSpider.log("TheIntroDB 限流，稍后重试");
+                return null;
+            }
+            if (response.code() == 404) return new JSONObject();
+            if (!response.isSuccessful() || response.body() == null) return null;
+            JSONObject json = new JSONObject(response.body().string());
+            return json.has("error") ? null : json;
+        } catch (Exception error) {
+            DanmakuSpider.log((theIntroDb ? "TheIntroDB" : "IntroDB")
+                    + " 标记查询失败: " + error.getClass().getSimpleName());
+            return null;
         }
-        result.source = source;
     }
 
     private static void readAniSkip(Markers result, String title, int season,
@@ -454,10 +644,10 @@ public final class AutoSkipService {
                 if ("op".equals(skipType) || "mixed-op".equals(skipType)) {
                     result.introStartMs = start;
                     result.introEndMs = end;
-                    result.source = "AniSkip";
+                    SkipSegmentSources.addSource(result, "AniSkip");
                 } else if ("ed".equals(skipType) || "mixed-ed".equals(skipType)) {
                     result.outroStartMs = start;
-                    result.source = TextUtils.isEmpty(result.source) ? "AniSkip" : result.source;
+                    SkipSegmentSources.addSource(result, "AniSkip");
                 }
             }
         } catch (Exception ignored) {
@@ -517,7 +707,8 @@ public final class AutoSkipService {
         if (TextUtils.isEmpty(raw)) return null;
         try {
             JSONObject json = new JSONObject(raw);
-            if (json.optLong("expires", 0) <= System.currentTimeMillis()) {
+            if (json.optInt("version", 0) != SEGMENT_CACHE_VERSION
+                    || json.optLong("expires", 0) <= System.currentTimeMillis()) {
                 prefs.edit().remove(cachePrefKey(key)).apply();
                 return null;
             }
@@ -528,6 +719,21 @@ public final class AutoSkipService {
             result.recapStartMs = json.optLong("recapStart", -1);
             result.recapEndMs = json.optLong("recapEnd", -1);
             result.imdbId = json.optString("imdbId", "");
+            result.tmdbId = json.optLong("tmdbId", 0);
+            result.movie = json.optBoolean("movie", false);
+            result.durationMs = json.optLong("durationMs", 0);
+            result.sourcesComplete = json.optBoolean("sourcesComplete", false);
+            JSONArray segments = json.optJSONArray("segments");
+            if (segments != null) for (int i = 0; i < segments.length(); i++) {
+                JSONObject segment = segments.optJSONObject(i);
+                if (segment != null) {
+                    SkipSegmentSources.Segment saved = new SkipSegmentSources.Segment(
+                            segment.optString("type"), segment.optLong("start", -1),
+                            segment.optLong("end", -1), segment.optString("source"));
+                    saved.durationMatched = segment.optBoolean("durationMatched", false);
+                    result.segments.add(saved);
+                }
+            }
             result.tmdbTitle = json.optString("tmdbTitle", "");
             result.source = json.optString("source", "");
             result.error = json.optString("error", "");
@@ -540,8 +746,15 @@ public final class AutoSkipService {
     private static void writeCache(Context context, String key, Markers value) {
         if (context == null || value == null) return;
         try {
-            long ttl = value.hasAny() ? SUCCESS_TTL_MS : FAILURE_TTL_MS;
+            long ttl = value.hasAny() && value.sourcesComplete ? SUCCESS_TTL_MS : FAILURE_TTL_MS;
+            JSONArray segments = new JSONArray();
+            for (SkipSegmentSources.Segment segment : value.segments) {
+                segments.put(new JSONObject().put("type", segment.type).put("start", segment.startMs)
+                        .put("end", segment.endMs).put("source", segment.source)
+                        .put("durationMatched", segment.durationMatched));
+            }
             JSONObject json = new JSONObject()
+                    .put("version", SEGMENT_CACHE_VERSION)
                     .put("expires", System.currentTimeMillis() + ttl)
                     .put("introStart", value.introStartMs)
                     .put("introEnd", value.introEndMs)
@@ -549,6 +762,11 @@ public final class AutoSkipService {
                     .put("recapStart", value.recapStartMs)
                     .put("recapEnd", value.recapEndMs)
                     .put("imdbId", value.imdbId)
+                    .put("tmdbId", value.tmdbId)
+                    .put("movie", value.movie)
+                    .put("durationMs", value.durationMs)
+                    .put("sourcesComplete", value.sourcesComplete)
+                    .put("segments", segments)
                     .put("tmdbTitle", value.tmdbTitle)
                     .put("source", value.source)
                     .put("error", value.error);
@@ -563,13 +781,13 @@ public final class AutoSkipService {
                 media.title, media.artist, media.url);
         String title = identity.getPrimarySearchName();
         int[] seasonEpisode = identity.getSeasonEpisode();
-        return makeCacheKey(title, seasonEpisode[0], seasonEpisode[1]);
+        return makeCacheKey(title, seasonEpisode[0], seasonEpisode[1], media.durationMs);
     }
 
-    private static String makeCacheKey(String title, int season, int episode) {
-        if (TextUtils.isEmpty(title) || episode <= 0) return "";
+    private static String makeCacheKey(String title, int season, int episode, long durationMs) {
+        if (TextUtils.isEmpty(title)) return "";
         return MediaIdentityResolver.normalizeForCompare(title)
-                + "|" + season + "|" + episode;
+                + "|" + season + "|" + episode + "|d" + Math.max(0, Math.round(durationMs / 1000.0));
     }
 
     private static String cachePrefKey(String key) {

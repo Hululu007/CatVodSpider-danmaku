@@ -11,6 +11,9 @@ import java.util.Set;
  */
 public class DanmakuConfig {
     public static final String DEFAULT_DANMAKU_STYLE = "模板五";
+    public static final String PLAYER_TOOLBAR_MODE_LEGACY = "legacy";
+    public static final String PLAYER_TOOLBAR_MODE_DIAGNOSE = "diagnose";
+    public static final String PLAYER_TOOLBAR_MODE_CUSTOM = "custom";
 
     /**
      * 内置 TMDB v3 API Key。用户可在局域网配置页扫码替换。
@@ -45,6 +48,14 @@ public class DanmakuConfig {
      */
     public String danmakuStyle;
     /**
+     * 播放器功能栏模式：legacy / diagnose / custom
+     */
+    public String playerToolbarMode;
+    /**
+     * 播放器功能栏诊断日志开关
+     */
+    public boolean playerToolbarDebug;
+    /**
      * 静默模式，开启时不再弹出任何提示信息
      */
     public boolean silentMode;
@@ -60,6 +71,8 @@ public class DanmakuConfig {
      * TMDB 查询语言
      */
     public String tmdbLanguage;
+    /** 剧名 Logo 磁盘缓存上限，单位 MB。 */
+    public int seriesLogoCacheMb = 30;
     /**
      * 代理类型：0=未设置，1=Go代理，2=Java代理
      */
@@ -74,6 +87,8 @@ public class DanmakuConfig {
         lpAlpha = 0.9f;
         autoPushEnabled = false;
         danmakuStyle = DEFAULT_DANMAKU_STYLE;
+        playerToolbarMode = PLAYER_TOOLBAR_MODE_CUSTOM;
+        playerToolbarDebug = false;
         silentMode = true;
         autoSkipEnabled = true;
         tmdbApiKey = DEFAULT_TMDB_API_KEY;
@@ -101,6 +116,12 @@ public class DanmakuConfig {
         if (json.has("danmakuStyle")) {
             setDanmakuStyle(json.optString("danmakuStyle", danmakuStyle));
         }
+        if (json.has("playerToolbarMode")) {
+            setPlayerToolbarMode(json.optString("playerToolbarMode", playerToolbarMode));
+        }
+        if (json.has("playerToolbarDebug")) {
+            setPlayerToolbarDebug(json.optBoolean("playerToolbarDebug", playerToolbarDebug));
+        }
         if (json.has("silentMode")) {
             setSilentMode(json.optBoolean("silentMode", silentMode));
         }
@@ -112,6 +133,9 @@ public class DanmakuConfig {
         }
         if (json.has("tmdbLanguage")) {
             setTmdbLanguage(json.optString("tmdbLanguage", tmdbLanguage));
+        }
+        if (json.has("seriesLogoCacheMb")) {
+            setSeriesLogoCacheMb(json.optInt("seriesLogoCacheMb", 30));
         }
         if (json.has("proxyType")) {
             setProxyType(json.optInt("proxyType", proxyType));
@@ -166,6 +190,28 @@ public class DanmakuConfig {
         this.danmakuStyle = DEFAULT_DANMAKU_STYLE;
     }
 
+    public String getPlayerToolbarMode() {
+        return playerToolbarMode;
+    }
+
+    public void setPlayerToolbarMode(String playerToolbarMode) {
+        String value = playerToolbarMode == null ? "" : playerToolbarMode.trim().toLowerCase();
+        if (PLAYER_TOOLBAR_MODE_DIAGNOSE.equals(value) || PLAYER_TOOLBAR_MODE_CUSTOM.equals(value)
+                || PLAYER_TOOLBAR_MODE_LEGACY.equals(value)) {
+            this.playerToolbarMode = value;
+        } else {
+            this.playerToolbarMode = PLAYER_TOOLBAR_MODE_CUSTOM;
+        }
+    }
+
+    public boolean isPlayerToolbarDebug() {
+        return playerToolbarDebug;
+    }
+
+    public void setPlayerToolbarDebug(boolean playerToolbarDebug) {
+        this.playerToolbarDebug = playerToolbarDebug;
+    }
+
     public boolean isSilentMode() {
         return silentMode;
     }
@@ -202,6 +248,14 @@ public class DanmakuConfig {
 
     public int getProxyType() {
         return proxyType;
+    }
+
+    public int getSeriesLogoCacheMb() {
+        return seriesLogoCacheMb >= 1 && seriesLogoCacheMb <= 300 ? seriesLogoCacheMb : 30;
+    }
+
+    public void setSeriesLogoCacheMb(int megabytes) {
+        seriesLogoCacheMb = Math.max(1, Math.min(300, megabytes));
     }
 
     public void setProxyType(int proxyType) {

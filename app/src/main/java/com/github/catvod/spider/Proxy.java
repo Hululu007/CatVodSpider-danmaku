@@ -11,13 +11,15 @@ public class Proxy {
 
     private static Method method;
     private static int port;
+    private static volatile boolean initialized;
 
     public static Object[] proxy(Map<String, String> params) {
         if ("ck".equals(params.get("do"))) return new Object[]{200, "text/plain; charset=utf-8", new ByteArrayInputStream("ok".getBytes(StandardCharsets.UTF_8))};
         return null;
     }
 
-    public static void init() {
+    public static synchronized void init() {
+        if (initialized) return;
         try {
             Class<?> clz = Class.forName("com.github.catvod.Proxy");
             port = (int) clz.getMethod("getPort").invoke(null);
@@ -25,10 +27,13 @@ public class Proxy {
             SpiderDebug.log("本地代理端口:" + port);
         } catch (Throwable e) {
             findPort();
+        } finally {
+            initialized = true;
         }
     }
 
     public static int getPort() {
+        if (!initialized) init();
         return port;
     }
 
@@ -41,6 +46,7 @@ public class Proxy {
     }
 
     public static String getUrl(boolean local) {
+        if (!initialized) init();
         try {
             return (String) method.invoke(null, local);
         } catch (Throwable e) {

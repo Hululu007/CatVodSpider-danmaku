@@ -42,6 +42,8 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
@@ -148,6 +150,7 @@ public class DanmakuUIHelper {
     private static final int AURORA_MUTED = 0xFF8FA1BE;
     private static final int AURORA_CYAN = 0xFF00B4D8;
     private static final int AURORA_MINT = 0xFF00F0C8;
+    private static final int AURORA_SELECTED_TEXT = 0xFFFFD54F;
     private static final int AURORA_GOLD = 0xFFFFD979;
 
     /**
@@ -232,6 +235,8 @@ public class DanmakuUIHelper {
                             Utils.safeShowToast(activity, "TMDB Key 已保存");
                         }, () -> tmdbInput.setText(config.getTmdbApiKey())));
 
+                root.addView(createSeriesLogoCacheSection(activity));
+
                 Button closeButton = createStyledButton(activity, "关闭", ACCENT_COLOR);
                 LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(activity, 44));
@@ -266,6 +271,72 @@ public class DanmakuUIHelper {
         input.setMaxLines(4);
         input.setSelectAllOnFocus(false);
         return input;
+    }
+
+    private static View createSeriesLogoCacheSection(Activity activity) {
+        LinearLayout section = new LinearLayout(activity);
+        section.setOrientation(LinearLayout.VERTICAL);
+        section.setPadding(dpToPx(activity, 10), dpToPx(activity, 12), dpToPx(activity, 10), dpToPx(activity, 10));
+        section.setBackgroundColor(0xFFF7F8FA);
+        TextView title = new TextView(activity);
+        title.setText("剧名 Logo 缓存");
+        title.setTextColor(TEXT_PRIMARY);
+        title.setTextSize(15);
+        section.addView(title);
+        TextView usage = new TextView(activity);
+        usage.setTextColor(TEXT_SECONDARY);
+        usage.setTextSize(13);
+        usage.setText("正在读取缓存占用…");
+        section.addView(usage);
+        SeriesLogoCache.UsageCallback refresh = bytes -> {
+            if (!activity.isFinishing() && !activity.isDestroyed()) usage.setText(String.format(
+                    java.util.Locale.ROOT, "已用 %.2f MB / 上限 %d MB · 超出后清理最久未使用的 Logo",
+                    bytes / (1024.0 * 1024.0), DanmakuConfigManager.getConfig(activity).getSeriesLogoCacheMb()));
+        };
+        SeriesLogoCache.usageAsync(activity, refresh);
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView label = new TextView(activity);
+        label.setText("缓存上限（MB）：");
+        label.setTextColor(TEXT_PRIMARY);
+        row.addView(label);
+        EditText limit = createConfigInput(activity,
+                String.valueOf(DanmakuConfigManager.getConfig(activity).getSeriesLogoCacheMb()), "1–300");
+        limit.setSingleLine(true);
+        limit.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        row.addView(limit, new LinearLayout.LayoutParams(0, dpToPx(activity, 44), 1));
+        section.addView(row);
+        LinearLayout actions = new LinearLayout(activity);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button save = createStyledButton(activity, "保存上限", PRIMARY_COLOR);
+        Button clear = createStyledButtonWithBorder(activity, "清理 Logo 缓存", PRIMARY_COLOR);
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(0, dpToPx(activity, 44), 1);
+        buttonParams.setMargins(dpToPx(activity, 4), dpToPx(activity, 6), dpToPx(activity, 4), 0);
+        actions.addView(save, buttonParams);
+        actions.addView(clear, new LinearLayout.LayoutParams(buttonParams));
+        section.addView(actions);
+        save.setOnClickListener(v -> {
+            try {
+                int megabytes = Integer.parseInt(limit.getText().toString().trim());
+                if (megabytes < 1 || megabytes > 300) throw new NumberFormatException();
+                DanmakuConfig latest = DanmakuConfigManager.getConfig(activity);
+                latest.setSeriesLogoCacheMb(megabytes);
+                DanmakuConfigManager.saveConfig(activity, latest);
+                SeriesLogoCache.trimAsync(activity, refresh);
+                Utils.safeShowToast(activity, "Logo 缓存上限已保存");
+            } catch (NumberFormatException error) { Utils.safeShowToast(activity, "请输入 1–300 MB"); }
+        });
+        clear.setOnClickListener(v -> {
+            clear.setEnabled(false);
+            SeriesLogoCache.clearAsync(activity, bytes -> {
+                if (activity.isFinishing() || activity.isDestroyed()) return;
+                clear.setEnabled(true);
+                refresh.onResult(bytes);
+                Utils.safeShowToast(activity, bytes == 0 ? "Logo 缓存已清理" : "部分缓存暂未清理，请重试");
+            });
+        });
+        return section;
     }
 
     private static View createConfigSection(Activity activity, String label, EditText input,
@@ -1477,29 +1548,9 @@ public class DanmakuUIHelper {
                         searchBtn.setTextSize(15);
                         searchBtn.setTypeface(null, android.graphics.Typeface.BOLD);
                         searchBtn.setTextColor(Color.WHITE);
-                        searchBtn.setBackground(isAuroraStyle ? createAuroraGradientSmallDrawable(activity) : createTVGradientSmallDrawable());
                         int searchBtnSize = isAuroraStyle ? auroraSize(activity, 40, 44, 50) : 50;
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                            searchBtn.setElevation(dpToPx(activity, 4));
-                        }
                         searchBtn.setLayoutParams(new LinearLayout.LayoutParams(dpToPx(activity, isAuroraStyle ? auroraSize(activity, 64, 84, 104) : 90), dpToPx(activity, searchBtnSize)));
-                        searchBtn.setOnFocusChangeListener((v, hasFocus) -> {
-                            if (hasFocus) {
-                                v.setBackground(isAuroraStyle ? createAuroraGradientDrawable(activity, 20) : createTVGradientDrawable());
-                                v.setScaleX(1.03f);
-                                v.setScaleY(1.03f);
-                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                                    v.setElevation(dpToPx(activity, 8));
-                                }
-                            } else {
-                                v.setBackground(isAuroraStyle ? createAuroraGradientSmallDrawable(activity) : createTVGradientSmallDrawable());
-                                v.setScaleX(1.0f);
-                                v.setScaleY(1.0f);
-                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                                    v.setElevation(dpToPx(activity, 4));
-                                }
-                            }
-                        });
+                        styleSearchButton(searchBtn);
 
                         reverseBtn = new Button(activity);
                         reverseBtn.setText("\u21C5");
@@ -1676,6 +1727,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                     mainLayout.addView(tabContainer);
 
                     ScrollView resultScroll = new ScrollView(activity);
+                    resultScroll.setFocusable(false);
+                    resultScroll.setFocusableInTouchMode(false);
                     resultScroll.setBackgroundColor(isDarkStyle ? Color.TRANSPARENT : (isTVStyle ? TV_DARK_BG : BACKGROUND_WHITE));
                     if (isTVStyle) {
                         android.graphics.drawable.GradientDrawable resultBg = new android.graphics.drawable.GradientDrawable();
@@ -1698,6 +1751,13 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
 
                     builder.setView(mainLayout);
                     final AlertDialog dialog = builder.create();
+                    final Button[] selectedSourceTab = {null};
+                    dialog.setOnKeyListener((ignored, key, event) -> SearchDialogFocus.recoverKey(
+                            mainLayout, selectedSourceTab[0] != null ? selectedSourceTab[0] : searchBtn, key, event));
+                    resultScroll.setOnFocusChangeListener((v, focused) -> {
+                        if (focused) SearchDialogFocus.restore(mainLayout,
+                                selectedSourceTab[0] != null ? selectedSourceTab[0] : searchBtn);
+                    });
 
                     dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
 
@@ -1732,6 +1792,9 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
 
                             resultContainer.removeAllViews();
                             tabContainer.removeAllViews();
+                            selectedSourceTab[0] = null;
+                            resultScroll.scrollTo(0, 0);
+                            SearchDialogFocus.restore(mainLayout, searchBtn);
                             TextView loading = new TextView(activity);
                             loading.setText("正在搜索: " + keyword);
                             loading.setGravity(Gravity.CENTER);
@@ -1759,6 +1822,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                     new Handler(Looper.getMainLooper()).post(new Runnable() {
                                         @Override
                                         public void run() {
+                                            if (!dialog.isShowing() || activity.isFinishing()
+                                                    || activity.isDestroyed()) return;
                                             resultContainer.removeAllViews();
                                             tabContainer.removeAllViews();
 
@@ -1769,6 +1834,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                 empty.setPadding(0, 50, 0, 50);
                                                 empty.setTextColor(isDarkStyle ? DARK_TEXT_SECONDARY : TEXT_SECONDARY);
                                                 resultContainer.addView(empty);
+                                                SearchDialogFocus.restore(mainLayout, searchBtn);
                                                 return;
                                             }
 
@@ -1789,6 +1855,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                 int tabAccent = getTemplateAccent(style);
                                                 Button tabBtn = new Button(activity);
                                                 tabBtn.setText(tabName);
+                                                tabBtn.setFocusable(true);
+                                                tabBtn.setFocusableInTouchMode(true);
                                                 tabBtn.setTextSize(13);
                                                 tabBtn.setTypeface(null, android.graphics.Typeface.BOLD);
                                                 tabBtn.setTextColor(isAuroraStyle ? AURORA_MUTED : TV_TEXT_SECONDARY);
@@ -1861,13 +1929,16 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                 tabBtn.setOnClickListener(new View.OnClickListener() {
                                                     @Override
                                                     public void onClick(View v1) {
+                                                        selectedSourceTab[0] = tabBtn;
+                                                        // Keep focus on the chosen source while replacing its rows.
+                                                        v1.requestFocus();
                                                         for (int j = 0; j < tabContainer.getChildCount(); j++) {
                                                             Button btn = (Button) tabContainer.getChildAt(j);
                                                             Object[] tag = (Object[]) btn.getTag();
                                                             if (j == tabIndex) {
                                                                 if (isTVStyle) {
                                                                      btn.setBackground(isAuroraStyle ? createAuroraPillDrawable(activity, true) : createTVPillDrawable(true));
-                                                                     btn.setTextColor(Color.WHITE);
+                                                                     btn.setTextColor(isAuroraStyle ? AURORA_SELECTED_TEXT : Color.WHITE);
                                                                  } else if (isDarkStyle) {
                                                                     btn.setBackground(createRoundedTransparentDrawable(finalTabAccent));
                                                                     btn.setTextColor(DARK_TEXT_PRIMARY);
@@ -1890,8 +1961,17 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                                 }
                                                                 tag[1] = inactive;
                                                             }
+                                                            if (isAuroraStyle) {
+                                                                applyAuroraFocusGlow(activity, btn, btn.hasFocus(), j == tabIndex);
+                                                            }
                                                         }
                                                         showResultsForTab(resultContainer, groupedResults.get(tabName), activity, dialog);
+                                                        resultScroll.scrollTo(0, 0);
+                                                        SearchDialogFocus.bindNavigation(tabContainer, resultContainer, tabBtn);
+                                                        SearchDialogFocus.restore(mainLayout, tabBtn);
+                                                        if (tabBtn.hasFocus() && isAuroraStyle) {
+                                                            applyAuroraFocusGlow(activity, tabBtn, true, true);
+                                                        }
                                                     }
                                                 });
 
@@ -1916,7 +1996,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                 }
                                                 if (isTVStyle) {
                                                     tabBtn.setBackground(isAuroraStyle ? createAuroraPillDrawable(activity, initialColor == finalTabAccent) : createTVPillDrawable(initialColor == finalTabAccent));
-                                                    tabBtn.setTextColor(initialColor == finalTabAccent ? Color.WHITE : (isAuroraStyle ? AURORA_MUTED : TV_TEXT_SECONDARY));
+                                                    tabBtn.setTextColor(initialColor == finalTabAccent ? (isAuroraStyle ? AURORA_SELECTED_TEXT : Color.WHITE) : (isAuroraStyle ? AURORA_MUTED : TV_TEXT_SECONDARY));
                                                 } else if (isDarkStyle) {
                                                     tabBtn.setBackground(createRoundedTransparentDrawable(initialColor));
                                                     tabBtn.setTextColor(DARK_TEXT_PRIMARY);
@@ -1926,9 +2006,13 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                                                 }
                                                 ((Object[]) tabBtn.getTag())[1] = initialColor;
                                                 if (initialColor == finalTabAccent) {
-                                                    showResultsForTab(resultContainer, groupedResults.get(tabName), activity, dialog);
+                                                    selectedSourceTab[0] = tabBtn;
                                                 }
                                             }
+                                            if (selectedSourceTab[0] == null && tabContainer.getChildCount() > 0) {
+                                                selectedSourceTab[0] = (Button) tabContainer.getChildAt(0);
+                                            }
+                                            if (selectedSourceTab[0] != null) selectedSourceTab[0].performClick();
                                         }
                                     });
                                 }
@@ -1955,6 +2039,28 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                     e.printStackTrace();
                 }
             }
+        });
+    }
+
+    static void styleSearchButton(Button button) {
+        final float normalTextPx = button.getTextSize();
+        button.setBackground(null);
+        button.setStateListAnimator(null);
+        button.setElevation(0f);
+        button.setTranslationZ(0f);
+        button.setPadding(0, 0, 0, 0);
+        button.setOnFocusChangeListener((view, focused) -> {
+            if (focused) {
+                android.graphics.drawable.GradientDrawable outline = new android.graphics.drawable.GradientDrawable();
+                outline.setColor(Color.TRANSPARENT);
+                outline.setCornerRadius(dpToPx(view.getContext(), 12));
+                outline.setStroke(dpToPx(view.getContext(), 2), AURORA_MINT);
+                view.setBackground(outline);
+            } else {
+                view.setBackground(null);
+            }
+            ((Button) view).setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX,
+                    normalTextPx * (focused ? 1.2f : 1f));
         });
     }
 
@@ -1988,6 +2094,9 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
     // 为指定页签显示结果
     private static void showResultsForTab(LinearLayout resultContainer, List<DanmakuItem> items,
                                           Activity activity, AlertDialog dialog) {
+        if (resultContainer.getParent() instanceof ScrollView) {
+            ((ScrollView) resultContainer.getParent()).scrollTo(0, 0);
+        }
         resultContainer.removeAllViews();
         currentItems = items;
 
@@ -2039,6 +2148,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         if (isAuroraStyle) {
             renderAuroraResults(resultContainer, animeGroups, groupsWithLastUrl, activity, dialog);
             resultContainer.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+            SearchDialogFocus.refreshNavigation(resultContainer);
             return;
         }
 
@@ -2684,11 +2794,12 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
             boolean expanded = hasSelectedGroup && groupsWithLastUrl.contains(animeTitle);
             LinearLayout card = createAuroraGroupCard(activity);
             LinearLayout header = createAuroraGroupHeader(activity, animeTitle, animeItems.size(), groupsWithLastUrl.contains(animeTitle));
-            GridLayout grid = createAuroraEpisodeGrid(activity, animeItems, dialog);
+            GridLayout grid = expanded ? createAuroraEpisodeGrid(activity, animeItems, dialog)
+                    : new GridLayout(activity);
             if (!expanded) grid.setVisibility(View.GONE);
             card.addView(header);
             card.addView(grid);
-            Object[] state = new Object[]{expanded, grid};
+            Object[] state = new Object[]{expanded, grid, animeItems.size()};
             header.setTag(state);
             updateAuroraGroupHeader(header, animeTitle, animeItems.size(), expanded, false);
             header.setOnClickListener(new View.OnClickListener() {
@@ -2708,16 +2819,26 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                         Object[] groupState = (Object[]) tag;
                         GridLayout groupGrid = (GridLayout) groupState[1];
                         boolean shouldExpand = groupHeader == v && nextExpanded;
+                        if (shouldExpand && groupGrid.getChildCount() == 0) {
+                            groupGrid = createAuroraEpisodeGrid(activity, animeItems, dialog);
+                            groupCard.removeViewAt(1);
+                            groupCard.addView(groupGrid);
+                            groupState[1] = groupGrid;
+                        }
                         groupGrid.setVisibility(shouldExpand ? View.VISIBLE : View.GONE);
                         groupState[0] = shouldExpand;
                         TextView title = findTaggedText(groupHeader, "title");
                         String titleText = title != null ? title.getText().toString() : animeTitle;
-                        updateAuroraGroupHeader(groupHeader, titleText, groupGrid.getChildCount(), shouldExpand, groupHeader.hasFocus());
+                        updateAuroraGroupHeader(groupHeader, titleText, (Integer) groupState[2],
+                                shouldExpand, groupHeader.hasFocus());
                         groupHeader.setTag(groupState);
                     }
+                    SearchDialogFocus.refreshNavigation(resultContainer);
                 }
             });
             header.setFocusable(true);
+            header.setFocusableInTouchMode(true);
+            header.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
             header.setClickable(true);
             header.setOnFocusChangeListener(new View.OnFocusChangeListener() {
                 @Override
@@ -2736,7 +2857,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                     @Override
                     public void run() {
                         View target = findDanmakuButton(grid);
-                        if (target != null) target.requestFocus();
+                        if (target != null && target.isAttachedToWindow() && target.isShown()
+                                && !dialog.getWindow().getDecorView().hasFocus()) target.requestFocus();
                     }
                 });
             }
@@ -2782,7 +2904,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         header.addView(titleWrap);
         header.addView(countPill);
         header.addView(foldPill);
-        updateAuroraGroupHeader(header, animeTitle, count, true, selected);
+        header.setSelected(selected);
+        updateAuroraGroupHeader(header, animeTitle, count, true, false);
         return header;
     }
 
@@ -2807,15 +2930,15 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         TextView foldPill = findTaggedText(header, "fold");
         if (title != null) {
             title.setText(animeTitle);
-            title.setTextColor(focused ? Color.WHITE : AURORA_TEXT);
+            title.setTextColor(header.isSelected() ? AURORA_SELECTED_TEXT : (focused ? Color.WHITE : AURORA_TEXT));
         }
         if (countPill != null) {
             countPill.setText(count + " 集");
-            countPill.setTextColor(AURORA_MINT);
+            countPill.setTextColor(header.isSelected() ? AURORA_SELECTED_TEXT : AURORA_MINT);
         }
         if (foldPill != null) {
             foldPill.setText(expanded ? "收起" : "展开");
-            foldPill.setTextColor(AURORA_TEXT);
+            foldPill.setTextColor(header.isSelected() ? AURORA_SELECTED_TEXT : AURORA_TEXT);
         }
     }
 
@@ -3379,6 +3502,10 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         public void onBindViewHolder(Holder holder, int position) {
             ChapterRow item = rows.get(position);
             holder.title.setText(item.title);
+            holder.title.setTag(item.autoToggle ? "chapter_auto_status" : null);
+            holder.itemView.setBackground(holder.itemView.hasFocus()
+                    ? createAuroraGridItemFocusedDrawable(activity) : createAuroraIconButtonDrawable(activity));
+            holder.title.setTextColor(holder.itemView.hasFocus() ? AURORA_MINT : AURORA_TEXT);
             holder.time.setText(item.autoToggle ? "切换"
                     : item.positionMs >= 0 ? ChapterManager.formatTime(item.positionMs) : "");
             holder.itemView.setEnabled(item.isClickable());
@@ -3479,6 +3606,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                     WindowManager.LayoutParams.MATCH_PARENT);
         }
         focusFirstChapterRow(recycler);
+        startChapterAutoTicker(dialog, recycler);
 
         new Thread(() -> {
             List<ChapterManager.Chapter> nativeChapters =
@@ -3563,6 +3691,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                     WindowManager.LayoutParams.MATCH_PARENT);
         }
         focusFirstChapterRow(rows);
+        startChapterAutoTicker(dialog, rows);
 
         new Thread(() -> {
             List<ChapterManager.Chapter> nativeChapters =
@@ -3640,26 +3769,31 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
     }
 
     private static void focusFirstChapterRow(ViewGroup container) {
-        if (container == null) return;
-        scheduleChapterRowFocus(container, 60);
-        scheduleChapterRowFocus(container, 220);
+        ChapterDialogFocus.restore(container);
     }
 
-    private static void scheduleChapterRowFocus(ViewGroup container, long delayMs) {
-        container.postDelayed(() -> {
-            if (!container.isShown()
-                    || container.getWindowVisibility() != View.VISIBLE) return;
-            if (container.findFocus() != null) return;
-            for (int i = 0; i < container.getChildCount(); i++) {
-                View child = container.getChildAt(i);
-                if (child != null && child.getVisibility() == View.VISIBLE
-                        && child.isEnabled() && child.isFocusable()) {
-                    child.requestFocus();
-                    return;
+    private static String chapterAutoTitle(Context context) {
+        DanmakuConfig config = DanmakuConfigManager.getConfig(context);
+        String status = config == null || !config.isAutoSkipEnabled() ? "关" : "开";
+        return "Auto 去片头尾：" + status;
+    }
+
+    private static void startChapterAutoTicker(Dialog dialog, ViewGroup container) {
+        Runnable tick = new Runnable() {
+            @Override public void run() {
+                if (!dialog.isShowing()) return;
+                View label = container.findViewWithTag("chapter_auto_status");
+                if (label instanceof TextView) {
+                    TextView text = (TextView) label;
+                    String status = chapterAutoTitle(container.getContext());
+                    if (!TextUtils.equals(text.getText(), status)) text.setText(status);
+                    text.setContentDescription(status);
                 }
+                container.postDelayed(this, 1000);
             }
-            if (container.isFocusable()) container.requestFocus();
-        }, delayMs);
+        };
+        dialog.setOnDismissListener(ignored -> container.removeCallbacks(tick));
+        container.post(tick);
     }
 
     private static void toggleChapterAuto(Activity activity, ChapterManager.MediaInfo media,
@@ -3704,6 +3838,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
 
             TextView name = new TextView(activity);
             name.setText(row.title);
+            name.setTag(row.autoToggle ? "chapter_auto_status" : null);
             name.setTextColor(AURORA_TEXT);
             name.setTextSize(auroraSize(activity, 14, 15, 17));
             name.setSingleLine(true);
@@ -3777,9 +3912,7 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
             List<ChapterManager.Chapter> nativeChapters) {
         List<ChapterRow> rows = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        DanmakuConfig config = DanmakuConfigManager.getConfig(context);
-        rows.add(new ChapterRow("Auto 去片头尾：" +
-                (config != null && config.isAutoSkipEnabled() ? "开" : "关"),
+        rows.add(new ChapterRow(chapterAutoTitle(context),
                 ChapterRow.AUTO_TOGGLE_POSITION, true));
         if (data.recapStartMs >= 0) {
             addChapterRow(rows, seen, "前情回顾", data.recapStartMs);
@@ -3793,6 +3926,11 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         if (data.outroStartMs > 0) {
             addChapterRow(rows, seen, "片尾", data.outroStartMs);
         }
+        if (data.providerChapters != null) {
+            for (ChapterManager.Chapter chapter : data.providerChapters) {
+                addChapterRow(rows, seen, chapter.title, chapter.startMs);
+            }
+        }
         if (nativeChapters != null) {
             for (ChapterManager.Chapter chapter : nativeChapters) {
                 addChapterRow(rows, seen, chapter.title, chapter.startMs);
@@ -3803,6 +3941,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                 addChapterRow(rows, seen, chapter.title, chapter.startMs);
             }
         }
+        Collections.sort(rows.subList(1, rows.size()),
+                (left, right) -> Long.compare(left.positionMs, right.positionMs));
         return rows;
     }
 
@@ -3841,8 +3981,16 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
             items.add(new ChapterManager.Chapter("marker-outro", "片尾",
                     data.outroStartMs, true));
         }
+        if (data.providerChapters != null) items.addAll(data.providerChapters);
         items.addAll(nativeChapters);
         items.addAll(data.chapters);
+        Set<String> seenItems = new HashSet<>();
+        Iterator<ChapterManager.Chapter> itemIterator = items.iterator();
+        while (itemIterator.hasNext()) {
+            ChapterManager.Chapter chapter = itemIterator.next();
+            if (!seenItems.add(chapter.startMs + "|" + chapter.title)) itemIterator.remove();
+        }
+        Collections.sort(items, (left, right) -> Long.compare(left.startMs, right.startMs));
 
         HorizontalScrollView scrollView = new HorizontalScrollView(activity);
         scrollView.setHorizontalScrollBarEnabled(false);
@@ -3997,263 +4145,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
     }
 
     private static void showChapterDialogInternal(Activity activity, ChapterManager.MediaInfo media) {
-        if (activity == null || activity.isFinishing() || media == null) return;
-        ChapterManager.ChapterData data = ChapterManager.loadData(activity, media);
-        List<ChapterManager.Chapter> nativeChapters = ChapterManager.getNativeChapters(activity);
-        List<ChapterManager.Chapter> markers = new ArrayList<>();
-        if (data.recapStartMs >= 0) {
-            markers.add(new ChapterManager.Chapter("marker-recap", "前情回顾",
-                    data.recapStartMs, true));
-        }
-        if (data.introStartMs >= 0) {
-            markers.add(new ChapterManager.Chapter("marker-intro-start", "片头开始",
-                    data.introStartMs, true));
-        }
-        if (data.introEndMs > 0) {
-            markers.add(new ChapterManager.Chapter("marker-intro-end", "片头结束",
-                    data.introEndMs, true));
-        }
-        if (data.outroStartMs > 0) {
-            markers.add(new ChapterManager.Chapter("marker-outro", "片尾",
-                    data.outroStartMs, true));
-        }
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(AURORA_BG);
-        root.setPadding(dpToPx(activity, auroraSize(activity, 14, 18, 24)),
-                dpToPx(activity, auroraSize(activity, 12, 16, 20)),
-                dpToPx(activity, auroraSize(activity, 14, 18, 24)),
-                dpToPx(activity, auroraSize(activity, 12, 16, 20)));
-
-        TextView title = new TextView(activity);
-        title.setText("章节与标记");
-        title.setTextColor(AURORA_TEXT);
-        title.setTextSize(auroraSize(activity, 20, 22, 24));
-        title.setTypeface(null, android.graphics.Typeface.BOLD);
-        root.addView(title);
-
-        TextView subtitle = new TextView(activity);
-        subtitle.setText(media.getDisplayTitle() + "\n当前 " + ChapterManager.formatTime(media.positionMs)
-                + " / " + ChapterManager.formatTime(media.durationMs));
-        subtitle.setTextColor(AURORA_MUTED);
-        subtitle.setTextSize(auroraSize(activity, 12, 13, 15));
-        subtitle.setPadding(0, dpToPx(activity, 6), 0, dpToPx(activity, 10));
-        root.addView(subtitle);
-
-        ScrollView scrollView = new ScrollView(activity);
-        LinearLayout list = new LinearLayout(activity);
-        list.setOrientation(LinearLayout.VERTICAL);
-        scrollView.addView(list, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(activity, 360));
-        scrollParams.setMargins(0, 0, 0, dpToPx(activity, 8));
-        root.addView(scrollView, scrollParams);
-
-        if (nativeChapters.isEmpty() && data.chapters.isEmpty() && markers.isEmpty()) {
-            TextView empty = new TextView(activity);
-            empty.setText("当前没有可跳转的章节或片头片尾标记。");
-            empty.setTextColor(AURORA_MUTED);
-            empty.setTextSize(auroraSize(activity, 13, 14, 16));
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(dpToPx(activity, 12), dpToPx(activity, 28),
-                    dpToPx(activity, 12), dpToPx(activity, 28));
-            list.addView(empty);
-        }
-
-        AlertDialog[] dialogHolder = new AlertDialog[1];
-        for (ChapterManager.Chapter marker : markers) {
-            list.addView(createChapterItem(activity, marker, "标记", dialogHolder, null, null));
-        }
-        for (ChapterManager.Chapter chapter : nativeChapters) {
-            list.addView(createChapterItem(activity, chapter, "章节", dialogHolder, null, null));
-        }
-        for (ChapterManager.Chapter chapter : data.chapters) {
-            list.addView(createChapterItem(activity, chapter, "自定义", dialogHolder, media, data));
-        }
-
-        TextView markerInfo = new TextView(activity);
-        markerInfo.setText("片头 " + ChapterManager.formatTime(data.introStartMs) + " → "
-                + ChapterManager.formatTime(data.introEndMs) + "   片尾 "
-                + ChapterManager.formatTime(data.outroStartMs) + "\n回顾 "
-                + ChapterManager.formatTime(data.recapStartMs) + " → "
-                + ChapterManager.formatTime(data.recapEndMs));
-        markerInfo.setTextColor(AURORA_CYAN);
-        markerInfo.setTextSize(auroraSize(activity, 11, 12, 14));
-        markerInfo.setPadding(0, dpToPx(activity, 8), 0, dpToPx(activity, 6));
-        root.addView(markerInfo);
-
-        LinearLayout markerRow = new LinearLayout(activity);
-        markerRow.setOrientation(LinearLayout.HORIZONTAL);
-        markerRow.addView(createChapterActionButton(activity, "片头起", v ->
-                setChapterMarker(activity, media, data, "introStart", dialogHolder)),
-                buttonRowParams(activity));
-        markerRow.addView(createChapterActionButton(activity, "片头止", v ->
-                setChapterMarker(activity, media, data, "introEnd", dialogHolder)),
-                buttonRowParams(activity));
-        markerRow.addView(createChapterActionButton(activity, "片尾起", v ->
-                setChapterMarker(activity, media, data, "outroStart", dialogHolder)),
-                buttonRowParams(activity));
-        root.addView(markerRow);
-
-        LinearLayout toggleRow = new LinearLayout(activity);
-        toggleRow.setOrientation(LinearLayout.HORIZONTAL);
-        toggleRow.setPadding(0, dpToPx(activity, 8), 0, dpToPx(activity, 8));
-        toggleRow.addView(createChapterActionButton(activity,
-                "自动跳片头：" + (data.autoIntro ? "开" : "关"), v -> {
-                    data.autoIntro = !data.autoIntro;
-                    ChapterManager.saveData(activity, media, data);
-                    if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-                    showChapterDialogInternal(activity, media);
-                }), buttonRowParams(activity));
-        toggleRow.addView(createChapterActionButton(activity,
-                "自动跳片尾：" + (data.autoEnding ? "开" : "关"), v -> {
-                    data.autoEnding = !data.autoEnding;
-                    ChapterManager.saveData(activity, media, data);
-                    if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-                    showChapterDialogInternal(activity, media);
-                }), buttonRowParams(activity));
-        root.addView(toggleRow);
-
-        LinearLayout bottomRow = new LinearLayout(activity);
-        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
-        bottomRow.addView(createChapterActionButton(activity, "添加当前章节", v ->
-                promptAddChapter(activity, media, data, dialogHolder)), buttonRowParams(activity));
-        bottomRow.addView(createChapterActionButton(activity, "刷新", v -> {
-            if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-            showChapterDialog(activity);
-        }), buttonRowParams(activity));
-        bottomRow.addView(createChapterActionButton(activity, "关闭", v -> {
-            if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-        }), buttonRowParams(activity));
-        root.addView(bottomRow);
-
-        builder.setView(root);
-        AlertDialog dialog = builder.create();
-        dialogHolder[0] = dialog;
-        if (dialog.getWindow() != null) {
-            dialog.getWindow().setBackgroundDrawable(
-                    new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-        }
-        safeShowDialog(activity, dialog);
-    }
-
-    private static View createChapterItem(Activity activity, ChapterManager.Chapter chapter,
-                                          String label, AlertDialog[] dialogHolder,
-                                          ChapterManager.MediaInfo media,
-                                          ChapterManager.ChapterData data) {
-        Button item = createChapterActionButton(activity,
-                label + "  " + chapter.title + "  [" + ChapterManager.formatTime(chapter.startMs) + "]",
-                v -> {
-                    boolean ok = ChapterManager.seekToManual(chapter.startMs);
-                    if (dialogHolder[0] != null && ok) dialogHolder[0].dismiss();
-                    if (!ok) Utils.safeShowToast(activity, "章节跳转失败");
-                });
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dpToPx(activity, auroraSize(activity, 44, 48, 56)));
-        params.setMargins(0, dpToPx(activity, 4), 0, dpToPx(activity, 4));
-        item.setLayoutParams(params);
-        if (media != null && data != null && chapter.id != null) {
-            item.setOnLongClickListener(v -> {
-                new AlertDialog.Builder(activity)
-                        .setTitle("删除自定义章节")
-                        .setMessage(chapter.title)
-                        .setPositiveButton("删除", (dialog, which) -> {
-                            ChapterManager.deleteCustomChapter(activity, media, data, chapter.id);
-                            if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-                            showChapterDialogInternal(activity, media);
-                        })
-                        .setNegativeButton("取消", null)
-                        .show();
-                return true;
-            });
-        }
-        return item;
-    }
-
-    private static Button createChapterActionButton(Activity activity, String text,
-                                                    View.OnClickListener listener) {
-        Button button = new Button(activity);
-        button.setText(text);
-        button.setTextColor(AURORA_TEXT);
-        button.setTextSize(auroraSize(activity, 12, 13, 15));
-        button.setAllCaps(false);
-        button.setGravity(Gravity.CENTER);
-        button.setSingleLine(true);
-        button.setPadding(dpToPx(activity, 8), 0, dpToPx(activity, 8), 0);
-        button.setBackground(createAuroraIconButtonDrawable(activity));
-        button.setFocusable(true);
-        button.setFocusableInTouchMode(true);
-        button.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                v.setBackground(createAuroraGridItemFocusedDrawable(activity));
-                ((Button) v).setTextColor(AURORA_MINT);
-            } else {
-                v.setBackground(createAuroraIconButtonDrawable(activity));
-                ((Button) v).setTextColor(AURORA_TEXT);
-            }
-        });
-        button.setOnClickListener(listener);
-        return button;
-    }
-
-    private static LinearLayout.LayoutParams buttonRowParams(Activity activity) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0,
-                dpToPx(activity, auroraSize(activity, 40, 44, 50)), 1f);
-        params.setMargins(dpToPx(activity, 3), 0, dpToPx(activity, 3), 0);
-        return params;
-    }
-
-    private static void setChapterMarker(Activity activity, ChapterManager.MediaInfo media,
-                                         ChapterManager.ChapterData data, String type,
-                                         AlertDialog[] dialogHolder) {
-        new Thread(() -> {
-            ChapterManager.MediaInfo current = ChapterManager.getMediaInfo();
-            if (current == null) {
-                activity.runOnUiThread(() ->
-                        Utils.safeShowToast(activity, "无法读取当前播放进度"));
-                return;
-            }
-            ChapterManager.setMarker(activity, media, data, type, current.positionMs);
-            activity.runOnUiThread(() -> {
-                if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-                Utils.safeShowToast(activity, "片头片尾标记已保存");
-                showChapterDialogInternal(activity, media);
-            });
-        }).start();
-    }
-
-    private static void promptAddChapter(Activity activity, ChapterManager.MediaInfo media,
-                                         ChapterManager.ChapterData data,
-                                         AlertDialog[] dialogHolder) {
-        EditText input = new EditText(activity);
-        input.setHint("章节名称");
-        input.setText("自定义章节 " + (data.chapters.size() + 1));
-        input.setTextColor(AURORA_TEXT);
-        input.setHintTextColor(AURORA_MUTED);
-        input.setSingleLine(true);
-        new AlertDialog.Builder(activity)
-                .setTitle("添加当前进度为章节")
-                .setView(input)
-                .setPositiveButton("添加", (dialog, which) -> new Thread(() -> {
-                    ChapterManager.MediaInfo current = ChapterManager.getMediaInfo();
-                    if (current == null) {
-                        activity.runOnUiThread(() ->
-                                Utils.safeShowToast(activity, "无法读取当前播放进度"));
-                        return;
-                    }
-                    ChapterManager.addCustomChapter(activity, media, data,
-                            input.getText().toString(), current.positionMs);
-                    activity.runOnUiThread(() -> {
-                        if (dialogHolder[0] != null) dialogHolder[0].dismiss();
-                        showChapterDialogInternal(activity, media);
-                    });
-                }).start())
-                .setNegativeButton("取消", null)
-                .show();
+        // Every path uses the read-only provider/native chapter sheet.
+        showChapterDialog(activity);
     }
 
     public static void dismissQRCodeDialog() {
@@ -4718,7 +4611,6 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
     }
 
     private static android.graphics.drawable.GradientDrawable createAuroraPillDrawable(Context context, boolean selected) {
-        if (selected) return createAuroraGradientDrawable(context, 25);
         android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
         gd.setColor(0x0EFFFFFF);
         gd.setCornerRadius(dpToPx(context, auroraSize(context, 16, 18, 20)));
@@ -4780,13 +4672,14 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         return gd;
     }
 
-    private static android.graphics.drawable.GradientDrawable createAuroraGridItemSelectedDrawable(Context context) {
-        return createAuroraGradientDrawable(context, 18);
-    }
-
     private static void applyAuroraFocusGlow(Context context, View v, boolean hasFocus, boolean selected) {
+        if (v instanceof TextView) {
+            ((TextView) v).setTextColor(selected ? AURORA_SELECTED_TEXT : (hasFocus ? AURORA_TEXT : AURORA_MUTED));
+        }
         if (hasFocus) {
-            v.setBackground(createAuroraGradientDrawable(context, 20));
+            android.graphics.drawable.GradientDrawable outline = createAuroraGroupHeaderFocusedDrawable(context);
+            outline.setCornerRadius(dpToPx(context, auroraSize(context, 16, 18, 20)));
+            v.setBackground(outline);
             v.setScaleX(1.025f);
             v.setScaleY(1.025f);
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
@@ -4830,8 +4723,9 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
 
         String currentDanmakuUrl = item.getDanmakuUrl();
         boolean isSelected = currentDanmakuUrl != null && currentDanmakuUrl.equals(DanmakuManager.lastDanmakuUrl);
-        resultItem.setText(createAuroraEpisodeText(episodeTitle, isSelected));
-        resultItem.setBackground(isSelected ? createAuroraGridItemSelectedDrawable(activity) : createAuroraGridItemDrawable(activity));
+        resultItem.setText(createAuroraEpisodeText(episodeTitle));
+        resultItem.setTextColor(isSelected ? AURORA_SELECTED_TEXT : AURORA_TEXT);
+        resultItem.setBackground(createAuroraGridItemDrawable(activity));
         resultItem.setTag(item);
 
         GridLayout.LayoutParams params = new GridLayout.LayoutParams();
@@ -4854,8 +4748,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                 String danmakuUrl = itemTag.getDanmakuUrl();
                 boolean isLastUrl = danmakuUrl != null && danmakuUrl.equals(DanmakuManager.lastDanmakuUrl);
                 if (hasFocus) {
-                    v.setBackground(isLastUrl ? createAuroraGridItemSelectedDrawable(activity) : createAuroraGridItemFocusedDrawable(activity));
-                    ((Button) v).setTextColor(isLastUrl ? Color.WHITE : AURORA_MINT);
+                    v.setBackground(createAuroraGridItemFocusedDrawable(activity));
+                    ((Button) v).setTextColor(isLastUrl ? AURORA_SELECTED_TEXT : AURORA_MINT);
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
                         v.setElevation(dpToPx(activity, 7));
                         v.setTranslationZ(dpToPx(activity, 5));
@@ -4865,8 +4759,8 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
                         v.setElevation(0);
                         v.setTranslationZ(0);
                     }
-                    v.setBackground(isLastUrl ? createAuroraGridItemSelectedDrawable(activity) : createAuroraGridItemDrawable(activity));
-                    ((Button) v).setTextColor(AURORA_TEXT);
+                    v.setBackground(createAuroraGridItemDrawable(activity));
+                    ((Button) v).setTextColor(isLastUrl ? AURORA_SELECTED_TEXT : AURORA_TEXT);
                     v.setScaleX(1.0f);
                     v.setScaleY(1.0f);
                 }
@@ -4895,11 +4789,10 @@ android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.Gr
         return resultItem;
     }
 
-    private static SpannableString createAuroraEpisodeText(String episodeTitle, boolean selected) {
+    private static SpannableString createAuroraEpisodeText(String episodeTitle) {
         String text = episodeTitle;
         SpannableString span = new SpannableString(text);
         span.setSpan(new RelativeSizeSpan(0.96f), 0, episodeTitle.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        span.setSpan(new ForegroundColorSpan(selected ? 0xEE04131B : AURORA_TEXT), 0, episodeTitle.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         return span;
     }
 

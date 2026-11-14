@@ -20,7 +20,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class GoProxyManager {
 
     public static final int DEFAULT_BACKEND_PORT = 5576;
+    static final String BINARY_BUILD = "go-range-20261114-r1";
     private static final int MAX_PORT_SCAN_COUNT = 20;
+    private static final long BINARY_START_TIMEOUT_MS = 5000L;
+    private static final long BINARY_START_POLL_INTERVAL_MS = 200L;
+    private static final int BINARY_START_TCP_TIMEOUT_MS = 200;
     private static final ExecutorService executor = Executors.newFixedThreadPool(5);
     static final AtomicBoolean isProxyRunning = new AtomicBoolean(false);
     private static final AtomicInteger startSessionSeq = new AtomicInteger(0);
@@ -232,29 +236,21 @@ public class GoProxyManager {
                 goProxyExecutableName = abs.contains("arm64-v8a") ? "goProxy-arm64" : "goProxy-arm";
             }
 
-            java.io.File file = new java.io.File(context.getCacheDir(), goProxyExecutableName);
+            HealthProbeResult existing = silentHealthCheck(ProxyManager.PROXY_PORT, 800);
+            if (existing.healthy && isGoHealthResponse(existing.body, ProxyManager.PROXY_PORT)) {
+                currentBackendPort = ProxyManager.PROXY_PORT;
+                isProxyRunning.set(true);
+                log("[二进制] 复用当前版本Go代理: " + BINARY_BUILD);
+                return;
+            }
+            java.io.InputStream asset = java.util.Objects.requireNonNull(Init.get().getClass().getClassLoader())
+                    .getResourceAsStream("assets/" + goProxyExecutableName);
+            java.io.File file = GoProxyBinaryCache.extract(context.getCacheDir(), goProxyExecutableName, asset);
+            if (!isStartSessionActive(sessionId)) return;
             java.io.File logFile = new java.io.File(context.getCacheDir(), "goproxy_output.log");
 
             java.lang.Process exec = Runtime.getRuntime().exec("/system/bin/sh");
             try (java.io.DataOutputStream dos = new java.io.DataOutputStream(exec.getOutputStream())) {
-                if (!file.exists()) {
-                    if (!file.createNewFile()) throw new Exception("创建文件失败 " + file);
-
-                    java.io.InputStream is = java.util.Objects.requireNonNull(Init.get().getClass().getClassLoader()).getResourceAsStream("assets/" + goProxyExecutableName);
-                    if (is == null) {
-                        throw new Exception("资源文件不存在: assets/" + goProxyExecutableName);
-                    }
-
-                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
-                        byte[] buffer = new byte[8192];
-                        int read;
-                        while ((read = is.read(buffer)) != -1) fos.write(buffer, 0, read);
-                    }
-                    if (!file.setExecutable(true)) throw new Exception(goProxyExecutableName + " setExecutable is false");
-                    dos.writeBytes("chmod 777 " + file.getAbsolutePath() + "\n");
-                    dos.flush();
-                }
-
                 log("[二进制] 启动 " + file);
                 dos.writeBytes("kill $(ps -ef | grep '" + goProxyExecutableName + "' | grep -v grep | awk '{print $2}') 2>/dev/null\n");
                 dos.flush();
@@ -266,7 +262,13 @@ public class GoProxyManager {
                 dos.flush();
             }
 
-            Thread.sleep(5000);
+            int earlyPort = waitForBinaryProxyPort(sessionId, logFile, BINARY_START_TIMEOUT_MS);
+            if (earlyPort > 0) {
+                currentBackendPort = earlyPort;
+                isProxyRunning.set(true);
+                log("[二进制] Go代理启动成功（快速探测），端口: " + currentBackendPort);
+                return;
+            }
             if (!isStartSessionActive(sessionId)) {
                 log("[二进制] 启动等待期间已取消，停止继续探测");
                 isProxyRunning.set(false);
@@ -320,7 +322,7 @@ public class GoProxyManager {
                             foundHealthy = true;
                             break;
                         }
-                        if (isBinaryStartupConfirmed(logFile, port)) {
+                        if (isBinaryStartupConfirmed(logFile, port) && isGoHealthResponse(probe.body, port)) {
                             currentBackendPort = port;
                             foundHealthy = true;
                             log("[探测] 端口 " + port + " 已确认HTTP服务运行(非标准响应)，且启动日志匹配，视为Go代理");
@@ -362,6 +364,35 @@ public class GoProxyManager {
             log("[二进制] 启动异常: " + e.getMessage());
             isProxyRunning.set(false);
         }
+    }
+
+    private static int waitForBinaryProxyPort(int sessionId, java.io.File logFile, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        List<Integer> candidatePorts = buildCandidatePorts();
+        while (System.currentTimeMillis() < deadline) {
+            if (!isStartSessionActive(sessionId)) {
+                return -1;
+            }
+            for (int port : candidatePorts) {
+                if (!isTcpPortOpen(port, BINARY_START_TCP_TIMEOUT_MS)) {
+                    continue;
+                }
+                HealthProbeResult probe = silentHealthCheck(port, 800);
+                if (probe.healthy && isGoHealthResponse(probe.body, port)) {
+                    return port;
+                }
+                if (probe.healthy && isGoHealthResponse(probe.body, port) && isBinaryStartupConfirmed(logFile, port)) {
+                    return port;
+                }
+            }
+            try {
+                Thread.sleep(BINARY_START_POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return -1;
+            }
+        }
+        return -1;
     }
 
     private static boolean isBinaryStartupConfirmed(java.io.File logFile, int port) {
@@ -438,7 +469,7 @@ public class GoProxyManager {
             long elapsed = System.currentTimeMillis() - startTime;
 
             if (!probe.healthy || TextUtils.isEmpty(probe.body) || elapsed >= 1000) return false;
-            if ("ok".equalsIgnoreCase(probe.body.trim())) return true;
+            if (hasSoAssets() && "ok".equalsIgnoreCase(probe.body.trim())) return true;
             return isGoHealthResponse(probe.body, port);
         } catch (Exception e) {
             return false;
@@ -453,7 +484,16 @@ public class GoProxyManager {
             if (!json.has("type")) return false;
             if (!"go".equalsIgnoreCase(json.get("type").getAsString())) return false;
             if (json.has("port") && json.get("port").getAsInt() != port) return false;
+            if (!hasSoAssets() && !isCurrentBinaryBuild(json)) return false;
             return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    static boolean isCurrentBinaryBuild(JsonObject json) {
+        try {
+            return json != null && json.has("build") && BINARY_BUILD.equals(json.get("build").getAsString());
         } catch (Exception ignored) {
             return false;
         }

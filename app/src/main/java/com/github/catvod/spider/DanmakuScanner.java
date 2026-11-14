@@ -1,15 +1,22 @@
 package com.github.catvod.spider;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.DialogInterface;
 import android.graphics.Color;
+import android.net.LocalServerSocket;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.ImageSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import com.github.catvod.spider.entity.DanmakuItem;
@@ -19,7 +26,10 @@ import com.github.catvod.net.OkHttp;
 import com.google.gson.Gson;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -72,9 +82,12 @@ public class DanmakuScanner {
     private static Timer hookTimer;
     private static volatile boolean isMonitoring = false;
     private static Timer playbackCheckTimer;
+    private static LocalServerSocket hookProcessSocket;
+    private static boolean hookProcessLockDeniedLogged;
     
     // 用于确保run方法串行执行的锁
     private static final Object runLock = new Object();
+    private static final Gson MEDIA_GSON = new Gson();
 
     // 主线程Handler
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -82,27 +95,75 @@ public class DanmakuScanner {
 
     private static boolean isLeoButtonInjected = false;
     private static volatile long lastMenuScanLogAt;
-
-    // 弹幕源URL（本插件推送的格式：.../api/v2/comment/{epId}?format=xml）
-    private static final Pattern DANMAKU_URL_PATTERN = Pattern.compile(
-            "(?i)[^ ]*?/api/v2/comment/([0-9]+)\\b"
-    );
-    // 通用格式：.../comment/{epId}...
-    private static final Pattern DANMAKU_URL_PATTERN2 = Pattern.compile(
-            "(?i)(?:https?://)?[^ ]*?/comment/([0-9]+)\\b"
-    );
-    // 用于apiBase前缀之后的相对匹配
-    private static final Pattern DANMAKU_EPID_AFTER_BASE = Pattern.compile(
-            "(?i)/api/v2/comment/([0-9]+)\\b"
-    );
-    // 完整弹幕URL（含query串），用于全文相等判断
-    private static final Pattern DANMAKU_FULL_URL_PATTERN = Pattern.compile(
-            "(?i)[^ \\t]*?/api/v2/comment/[0-9]+[^ \\t]*"
-    );
-    // 通用完整格式：.../comment/{epId}...
-    private static final Pattern DANMAKU_FULL_URL_PATTERN2 = Pattern.compile(
-            "(?i)(?:https?://)?[^ \\t]*?/comment/[0-9]+[^ \\t]*"
-    );
+    private static final AtomicBoolean menuScanPending = new AtomicBoolean();
+    private static final DanmakuMenuRelabeler menuRelabeler =
+            new DanmakuMenuRelabeler(mainHandler, DanmakuScanner::buildDanmakuLabel);
+    private static final Runnable MENU_SCAN_TASK = () -> {
+        try {
+            Activity activity = Utils.getTopActivity();
+            if (isMonitoring && activity != null && !activity.isFinishing()
+                    && !activity.isDestroyed() && !PlayerToolbarProbe.isDiagnose(activity)) {
+                relabelDanmakuMenu(activity);
+            } else {
+                menuScanPending.set(false);
+            }
+        } catch (Exception e) {
+            menuRelabeler.cancel();
+            menuScanPending.set(false);
+            DanmakuSpider.log("❌ 弹幕菜单重标记异常: " + e.getMessage());
+        }
+    };
+    private static final String EPISODE_TITLE_TAG = "episode_title_overlay";
+    private static volatile WeakReference<TextView> episodeTitleOverlay =
+            new WeakReference<>(null);
+    private static volatile String episodeTitleText = "";
+    private static android.graphics.Bitmap episodeTitleLogo;
+    private static volatile String episodeTitleRequestSignature = "";
+    private static volatile long episodeTitleRetryAt;
+    private static volatile boolean episodeTitleRequestPending;
+    private static volatile boolean episodeTitleEligible = false;
+    private static volatile boolean episodeTitleToolbarVisible = false;
+    private static volatile boolean episodeTitleToolbarSuppressed = false;
+    private static volatile boolean episodeTitlePaused = false;
+    private static volatile long episodeTitleHideAt = 0;
+    private static volatile WeakReference<View> episodeTitleControl =
+            new WeakReference<>(null);
+    private static volatile boolean episodeTitleVisibilityWatcherRunning = false;
+    private static volatile WeakReference<Activity> playerToolbarActivity =
+            new WeakReference<>(null);
+    private static volatile WeakReference<ViewGroup> playerToolbarParent =
+            new WeakReference<>(null);
+    private static volatile WeakReference<View> playerToolbarAnchor =
+            new WeakReference<>(null);
+    private static volatile WeakReference<View[]> playerToolbarArrangement =
+            new WeakReference<>(null);
+    private static volatile int playerToolbarChildCount = -1;
+    private static final long EPISODE_TITLE_VISIBLE_MS = 5000;
+    private static final long EPISODE_TITLE_TOOLBAR_POLL_MS = 150;
+    private static final float EPISODE_TITLE_BASE_SIZE_SP = 40.5f;
+    private static final float EPISODE_TITLE_LINE_SCALE = 0.80f;
+    private static final float EPISODE_TITLE_NAME_SCALE = 0.5265f;
+    private static final float EPISODE_TITLE_ALPHA = 0.90f;
+    private static final int EPISODE_TITLE_LOGO_HEIGHT_PX = 140;
+    private static final int EPISODE_TITLE_LOGO_WIDTH_PX = 470;
+    private static final Runnable HIDE_EPISODE_TITLE_TASK = () -> {
+        episodeTitleHideAt = 0;
+        updateEpisodeTitleVisibility();
+    };
+    private static final Runnable EPISODE_TITLE_VISIBILITY_WATCHER = new Runnable() {
+        @Override
+        public void run() {
+            TextView title = episodeTitleOverlay.get();
+            View control = episodeTitleControl.get();
+            if (title == null || control == null) {
+                episodeTitleVisibilityWatcherRunning = false;
+                return;
+            }
+            boolean visible = isEpisodeTitleToolbarVisible(control);
+            updateEpisodeTitleToolbarVisibility(visible);
+            mainHandler.postDelayed(this, EPISODE_TITLE_TOOLBAR_POLL_MS);
+        }
+    };
 
     // 启动Hook监控
     public static void startHookMonitor() {
@@ -110,8 +171,16 @@ public class DanmakuScanner {
             DanmakuSpider.log("⚠️ Hook监控已在运行中");
             return;
         }
+        if (!acquireHookProcessLock()) {
+            if (!hookProcessLockDeniedLogged) {
+                hookProcessLockDeniedLogged = true;
+                DanmakuSpider.log("Hook监控已由另一个插件实例启动，跳过重复实例");
+            }
+            return;
+        }
 
         DanmakuSpider.log("🚀 启动Hook监控");
+        DanmakuSpider.log("弹幕菜单扫描 BUILD " + DanmakuMenuRelabeler.BUILD);
         isMonitoring = true;
         isFirstDetection = true;
 
@@ -123,17 +192,11 @@ public class DanmakuScanner {
                     try {
                         Activity act = Utils.getTopActivity();
                         if (act != null && !act.isFinishing()) {
+                            boolean diagnoseMode = PlayerToolbarProbe.isDiagnose(act);
                             // 重标记播放器弹幕菜单项（用剧集名替换URL显示），任意界面都扫描
-                            mainHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    try {
-                                        relabelDanmakuMenu(act);
-                                    } catch (Exception e) {
-                                        DanmakuSpider.log("❌ 弹幕菜单重标记异常: " + e.getMessage());
-                                    }
-                                }
-                            });
+                            if (!diagnoseMode && menuScanPending.compareAndSet(false, true)) {
+                                if (!mainHandler.post(MENU_SCAN_TASK)) menuScanPending.set(false);
+                            }
 
                             // 检查是否是播放界面
                             String className = act.getClass().getName().toLowerCase();
@@ -141,26 +204,34 @@ public class DanmakuScanner {
 //                            DanmakuSpider.log("[Monitor] 检测到播放界面: " + className);
 
                                 ChapterManager.startAutoSkip(act);
-                                mainHandler.post(() -> {
-                                    try {
-                                        syncPlayerToolbar(act);
-                                    } catch (Exception e) {
-                                        DanmakuSpider.log("播放器功能栏同步异常: " + e.getMessage());
-                                    }
-                                });
-
-                                // 注入Leo弹幕按钮0
-                                if (!isLeoButtonInjected) {
-                                    mainHandler.post(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            try {
-                                                injectLeoButton(act);
-                                            } catch (Exception e) {
-                                                DanmakuSpider.log("❌ 按钮注入异常: " + e.getMessage());
-                                            }
+                                if (diagnoseMode) {
+                                    mainHandler.post(() -> {
+                                        PlayerToolbarController.release(act);
+                                        PlayerToolbarProbe.probe(act, "player-scan");
+                                    });
+                                } else {
+                                    mainHandler.post(() -> {
+                                        try {
+                                            HostDanmakuGate.observe(act);
+                                            syncPlayerToolbar(act);
+                                        } catch (Exception e) {
+                                            DanmakuSpider.log("播放器功能栏同步异常: " + e.getMessage());
                                         }
                                     });
+
+                                    // 注入Leo弹幕按钮0
+                                    if (!isLeoButtonInjected) {
+                                        mainHandler.post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                try {
+                                                    injectLeoButton(act);
+                                                } catch (Exception e) {
+                                                    DanmakuSpider.log("❌ 按钮注入异常: " + e.getMessage());
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
 
                                 // 检查播放状态
@@ -176,23 +247,34 @@ public class DanmakuScanner {
                                 }
 
                                 isVideoPlaying = media.isPlaying();
+                                updateEpisodeTitlePlaybackState(media);
+                                // Display metadata is independent of automatic danmaku search,
+                                // including when playback is paused before the first scan.
+                                lastEpisodeInfo = getEpisodeInfo(media, act);
+                                String titleSignature = lastEpisodeInfo.getSeriesName() + "|"
+                                        + lastEpisodeInfo.getEpisodeSeasonNum() + "|"
+                                        + lastEpisodeInfo.getEpisodeNum() + "|" + media.getUrl();
+                                if (!titleSignature.equals(episodeTitleRequestSignature)) {
+                                    PlayerToolbarController.onMediaChanged(act);
+                                }
+                                updateEpisodeTitleAsync(act, lastEpisodeInfo, titleSignature);
 
                                 if (isVideoPlaying) {
                                     stopConfirmCount = 0;
                                     // 获取媒体信息
-                                    lastEpisodeInfo = getEpisodeInfo(media, act);
                                     ChapterManager.requestAutoMarkers(act, media);
 
                                     // 视频开始播放
                                     videoPlayStartTime = System.currentTimeMillis();
 //                                    DanmakuSpider.log("▶️ 检测到视频开始播放");
                                 } else {
-                                    stopConfirmCount++;
+                                    if (stopConfirmCount < 4) stopConfirmCount++;
                                     if (stopConfirmCount < 3) {
                                         return;
                                     }
                                     // 视频停止播放
-                                    DanmakuSpider.log("⏸️ 检测到视频停止播放");
+                                    if (stopConfirmCount == 3)
+                                        DanmakuSpider.log("⏸️ 检测到视频停止播放");
 
                                     // 清空缓存和队列
                                     pendingPushes.clear();
@@ -225,6 +307,23 @@ public class DanmakuScanner {
 
         // 启动播放状态检查定时器
         startPlaybackCheckTimer();
+    }
+
+    private static boolean acquireHookProcessLock() {
+        if (hookProcessSocket != null) return true;
+        Context context = Init.context();
+        if (context == null) {
+            Activity activity = Utils.getTopActivity();
+            context = activity == null ? null : activity.getApplicationContext();
+        }
+        if (context == null) return false;
+        String name = context.getPackageName() + ".danmaku.hook";
+        try {
+            hookProcessSocket = new LocalServerSocket(name);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static EpisodeInfo getEpisodeInfo(Media media, Activity act) {
@@ -280,8 +379,7 @@ public class DanmakuScanner {
         }
 //                            DanmakuSpider.log("[Monitor] mediaJson: " + mediaJson);
 
-        Gson gson = new Gson();
-        Media media = gson.fromJson(mediaJson, Media.class);
+        Media media = MEDIA_GSON.fromJson(mediaJson, Media.class);
 
         // 兼容影视仓
         if (TextUtils.isEmpty(media.getArtist())) {
@@ -419,6 +517,7 @@ public class DanmakuScanner {
         stopConfirmCount = 0;
         videoPlayStartTime = 0;
         isLeoButtonInjected = false;
+        hideEpisodeTitleOverlay();
     }
 
     // 检查并执行待推送任务
@@ -512,6 +611,11 @@ public class DanmakuScanner {
     // 停止Hook监控
     public static void stopHookMonitor() {
         isMonitoring = false;
+        mainHandler.removeCallbacks(MENU_SCAN_TASK);
+        mainHandler.post(() -> {
+            menuRelabeler.cancel();
+            menuScanPending.set(false);
+        });
 
         // 取消延迟任务
         if (delayedPushTask != null) {
@@ -533,12 +637,13 @@ public class DanmakuScanner {
         pendingPushes.clear();
         lastPushTime.clear();
         isLeoButtonInjected = false;
+        hideEpisodeTitleOverlay();
 
         DanmakuSpider.log("🛑 Hook监控已停止");
     }
 
     // 判断是否为播放界面
-    private static boolean isPlayerActivity(String className) {
+    static boolean isPlayerActivity(String className) {
         return className.contains("videoactivity") || className.contains("detailactivity");
 
 //        DanmakuSpider.log("className: " + className);
@@ -566,6 +671,7 @@ public class DanmakuScanner {
 
         if (!isSameVideo) {
             // 不同的视频
+            PlayerToolbarController.onMediaChanged(activity);
             DanmakuManager.currentVideoSignature = newSignature;
             DanmakuManager.lastVideoDetectedTime = System.currentTimeMillis();
 
@@ -684,6 +790,7 @@ public class DanmakuScanner {
     // 重标记播放器弹幕菜单项：将弹幕源URL文本替换为"剧名 集标题"
     private static void relabelDanmakuMenu(Activity activity) {
         if (activity == null || activity.isFinishing()) return;
+        if (PlayerToolbarProbe.isDiagnose(activity)) return;
         java.util.List<View> collected = new java.util.ArrayList<>();
         String routes = "";
 
@@ -700,8 +807,9 @@ public class DanmakuScanner {
             logMenuScanThrottled("[弹幕菜单扫描] 路A失败: " + e);
         }
 
+        // A already returns all windows; alternate routes are fallbacks, not extra scans.
         // 路B: 反射 WindowManagerGlobal.mViews 字段
-        try {
+        if (collected.isEmpty()) try {
             Class<?> wmgCls = Class.forName("android.view.WindowManagerGlobal");
             Object wmg = wmgCls.getMethod("getInstance").invoke(null);
             java.lang.reflect.Field f = wmgCls.getDeclaredField("mViews");
@@ -716,7 +824,7 @@ public class DanmakuScanner {
         }
 
         // 路C: WindowManagerImpl.getDefault().mGlobal.mViews
-        try {
+        if (collected.isEmpty()) try {
             Class<?> wmCls = Class.forName("android.view.WindowManagerImpl");
             Object wm = wmCls.getMethod("getDefault").invoke(null);
             java.lang.reflect.Field globalF = wmCls.getDeclaredField("mGlobal");
@@ -734,7 +842,7 @@ public class DanmakuScanner {
         }
 
         // 路D: 反射遍历顶层Activity的DialogFragment弹窗（FongMi系 DanmakuDialog 是 BottomSheetDialogFragment）
-        try {
+        if (collected.isEmpty()) try {
             java.lang.reflect.Method getSfm;
             try {
                 getSfm = activity.getClass().getMethod("getSupportFragmentManager");
@@ -796,42 +904,8 @@ public class DanmakuScanner {
             logMenuScanThrottled("[弹幕菜单扫描] 窗口类: " + (root.getClass().getName())
                     + " 子数: " + (root instanceof ViewGroup
                     ? ((ViewGroup) root).getChildCount() : 0));
-            relabelInView(root);
         }
-    }
-
-    // 深度遍历视图树，替换匹配弹幕URL文本的TextView
-    private static void relabelInView(View view) {
-        if (view == null) return;
-        if (view instanceof TextView) {
-            TextView tv = (TextView) view;
-            CharSequence cs = tv.getText();
-            if (cs == null || cs.length() == 0) return;
-            String text = cs.toString();
-            String epIdStr = matchDanmakuEpId(text);
-            if (epIdStr == null) return;
-            // 关键保护：仅当TextView全文就是该弹幕URL时才替换，
-            // 避免误改日志查看器等包含URL的长文本（如整段日志）。
-            String url = matchDanmakuUrl(text);
-            if (url == null || !text.trim().equalsIgnoreCase(url)) return;
-            String label = buildDanmakuLabel(epIdStr);
-            if (label == null) {
-                logMenuScanThrottled("[弹幕菜单扫描] 匹配到URL但无法生成标签, epId="
-                        + epIdStr + " 文本: " + text);
-                return;
-            }
-            if (!label.equals(text)) {
-                tv.setText(label);
-                tv.setTag("danmaku_labeled");
-                DanmakuSpider.log("📺 弹幕菜单项: " + text + " → " + label);
-            }
-        } else if (view instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) view;
-            int count = group.getChildCount();
-            for (int i = 0; i < count; i++) {
-                relabelInView(group.getChildAt(i));
-            }
-        }
+        menuRelabeler.start(windowViews, () -> menuScanPending.set(false));
     }
 
     private static void logMenuScanThrottled(String message) {
@@ -839,42 +913,6 @@ public class DanmakuScanner {
         if (now - lastMenuScanLogAt < 60000) return;
         lastMenuScanLogAt = now;
         DanmakuSpider.log(message);
-    }
-
-    // 从文本中提取弹幕epId（多重匹配）
-    private static String matchDanmakuEpId(String text) {
-        try {
-            Matcher m = DANMAKU_URL_PATTERN.matcher(text);
-            if (m.find()) return m.group(1);
-            m = DANMAKU_URL_PATTERN2.matcher(text);
-            if (m.find()) return m.group(1);
-            // 用当前所有已知apiBase前缀匹配
-            for (DanmakuItem item : DanmakuManager.lastDanmakuItemMap.values()) {
-                if (item == null || TextUtils.isEmpty(item.getApiBase())) continue;
-                String prefix = item.getApiBase();
-                int idx = text.indexOf(prefix);
-                if (idx < 0) continue;
-                String rest = text.substring(idx + prefix.length());
-                Matcher m2 = DANMAKU_EPID_AFTER_BASE.matcher(rest);
-                if (m2.find()) return m2.group(1);
-            }
-        } catch (Exception e) {
-            // 忽略异常
-        }
-        return null;
-    }
-
-    // 提取文本中匹配到的完整弹幕URL（含query），用于全文相等判断（防止误改长文本）
-    private static String matchDanmakuUrl(String text) {
-        try {
-            Matcher m = DANMAKU_FULL_URL_PATTERN.matcher(text);
-            if (m.find()) return m.group(0).trim();
-            m = DANMAKU_FULL_URL_PATTERN2.matcher(text);
-            if (m.find()) return m.group(0).trim();
-        } catch (Exception e) {
-            // 忽略异常
-        }
-        return null;
     }
 
     // 根据epId生成友好的剧集标签
@@ -917,6 +955,8 @@ public class DanmakuScanner {
         if (activity == null || activity.isFinishing()) {
             return;
         }
+        if (PlayerToolbarProbe.isDiagnose(activity)) return;
+        if (PlayerToolbarController.suppressLegacy(activity)) return;
 
 //        DanmakuSpider.log("[按钮注入] 开始尝试注入按钮");
 
@@ -979,6 +1019,8 @@ public class DanmakuScanner {
 
     // 注入Leo弹幕按钮（原版逻辑）
     private static void injectButton(ViewGroup parent, TextView anchor) {
+        if (parent == null || anchor == null || PlayerToolbarProbe.isDiagnose(parent.getContext())) return;
+        if (PlayerToolbarController.owns(parent.getContext())) return;
         try {
             View existing = parent.findViewWithTag("danmu_button");
             String anchorText = anchor.getText().toString();
@@ -1178,8 +1220,39 @@ public class DanmakuScanner {
 
     private static void syncPlayerToolbar(Activity activity) {
         if (activity == null || activity.isFinishing()) return;
+        if (PlayerToolbarProbe.isDiagnose(activity)) return;
+        if (PlayerToolbarController.sync(activity)) {
+            ViewGroup toolbar = PlayerToolbarController.toolbarRow(activity);
+            if (toolbar != null) ensureEpisodeTitleOverlay(toolbar);
+            return;
+        }
         View root = activity.getWindow().getDecorView();
         if (root == null) return;
+
+        ViewGroup cachedParent = playerToolbarParent.get();
+        View cachedAnchor = playerToolbarAnchor.get();
+        View[] cachedArrangement = playerToolbarArrangement.get();
+        if (playerToolbarActivity.get() == activity
+                && cachedParent != null
+                && cachedAnchor != null
+                && cachedArrangement != null
+                && cachedParent.isAttachedToWindow()
+                && cachedParent.getRootView() == root
+                && cachedParent.getChildCount() == playerToolbarChildCount
+                && cachedAnchor.getParent() == cachedParent) {
+            boolean stillArranged = true;
+            for (View view : cachedArrangement) {
+                if (view == null || view.getParent() != cachedParent) {
+                    stillArranged = false;
+                    break;
+                }
+            }
+            if (stillArranged) {
+                ensureEpisodeTitleOverlay(cachedParent);
+                return;
+            }
+        }
+
         removeInjectedView(root, "auto_button");
         removeInjectedView(root, "intro_marker_button");
         removeInjectedView(root, "outro_marker_button");
@@ -1188,6 +1261,7 @@ public class DanmakuScanner {
     }
 
     private static void ensureChapterButton(View root) {
+        if (root == null || PlayerToolbarProbe.isDiagnose(root.getContext())) return;
         if (root == null || root.findViewWithTag("chapter_button") != null) return;
         View danmuButton = root.findViewWithTag("danmu_button");
         if (danmuButton != null && danmuButton.getParent() instanceof ViewGroup) {
@@ -1202,6 +1276,7 @@ public class DanmakuScanner {
 
     private static void injectChapterButton(ViewGroup parent, View anchor) {
         if (parent == null || anchor == null || parent.findViewWithTag("chapter_button") != null) return;
+        if (PlayerToolbarProbe.isDiagnose(parent.getContext())) return;
         if (isInRecyclerView(parent)) return;
         try {
             TextView chapterButton = createToolbarButton(parent, anchor, "chapter_button", "章节");
@@ -1300,11 +1375,13 @@ public class DanmakuScanner {
     }
 
     private static void arrangePlayerButtons(View root) {
+        if (root == null || PlayerToolbarProbe.isDiagnose(root.getContext())) return;
         TextView nativeDanmaku = findNativeDanmakuButton(root, 0);
         if (nativeDanmaku == null || !(nativeDanmaku.getParent() instanceof ViewGroup)) return;
         ViewGroup parent = (ViewGroup) nativeDanmaku.getParent();
         if (parent.getClass().getName().contains("RecyclerView")
                 || parent.getClass().getName().contains("RelativeLayout")) return;
+        ensureEpisodeTitleOverlay(parent);
 
         List<View> ordered = new ArrayList<>();
         addToolbarButtonById(parent, ordered, "player", "IJK");
@@ -1350,6 +1427,7 @@ public class DanmakuScanner {
                 spacingChanged |= applyToolbarSpacing(view, horizontalGap);
             }
             if (spacingChanged) parent.requestLayout();
+            cachePlayerToolbar(parent, nativeDanmaku, ordered);
             return;
         }
 
@@ -1365,6 +1443,407 @@ public class DanmakuScanner {
             parent.addView(view, insertIndex++, params);
         }
         parent.requestLayout();
+        cachePlayerToolbar(parent, nativeDanmaku, ordered);
+    }
+
+    private static void cachePlayerToolbar(ViewGroup parent, View anchor, List<View> ordered) {
+        Activity activity = parent.getContext() instanceof Activity
+                ? (Activity) parent.getContext() : null;
+        playerToolbarActivity = new WeakReference<>(activity);
+        playerToolbarParent = new WeakReference<>(parent);
+        playerToolbarAnchor = new WeakReference<>(anchor);
+        playerToolbarArrangement =
+                new WeakReference<>(ordered.toArray(new View[0]));
+        playerToolbarChildCount = parent.getChildCount();
+    }
+
+    private static void updateEpisodeTitleAsync(Activity activity, EpisodeInfo info,
+                                                String signature) {
+        if (activity == null || info == null) return;
+
+        String baseText = buildEpisodeTitleText(info);
+        if (TextUtils.isEmpty(signature)) return;
+        if (signature.equals(episodeTitleRequestSignature)
+                && (episodeTitleRequestPending || episodeTitleRetryAt == 0
+                || System.currentTimeMillis() < episodeTitleRetryAt)) return;
+        episodeTitleRequestSignature = signature;
+        episodeTitleRequestPending = true;
+        episodeTitleRetryAt = 0;
+        episodeTitleEligible = false;
+        episodeTitleHideAt = 0;
+        episodeTitleText = "";
+        episodeTitleLogo = null;
+        mainHandler.removeCallbacks(HIDE_EPISODE_TITLE_TASK);
+        mainHandler.post(() -> {
+            if (!signature.equals(episodeTitleRequestSignature)) return;
+            applyEpisodeTitleText();
+            updateEpisodeTitleVisibility();
+        });
+
+        String title = !TextUtils.isEmpty(info.getSeriesName())
+                ? info.getSeriesName()
+                : (info.getEpisodeNames() != null && !info.getEpisodeNames().isEmpty()
+                ? info.getEpisodeNames().get(0) : "");
+        int episode = MediaIdentityResolver.parseEpisodeNumber(info.getEpisodeNum());
+        int season = 1;
+        try {
+            if (!TextUtils.isEmpty(info.getEpisodeSeasonNum())) {
+                season = Integer.parseInt(info.getEpisodeSeasonNum().trim());
+            }
+        } catch (Exception ignored) {
+        }
+        if (TextUtils.isEmpty(title) || episode <= 0) {
+            episodeTitleRequestPending = false;
+            mainHandler.post(() -> {
+                if (!signature.equals(episodeTitleRequestSignature)) return;
+                episodeTitleEligible = false;
+                episodeTitleHideAt = 0;
+                episodeTitleText = "";
+                mainHandler.removeCallbacks(HIDE_EPISODE_TITLE_TASK);
+                applyEpisodeTitleText();
+                updateEpisodeTitleVisibility();
+            });
+            return;
+        }
+
+        final int requestSeason = season;
+        final int requestEpisode = episode;
+        final String requestSignature = signature;
+        final String requestBaseText = baseText;
+        android.content.Context appContext = activity.getApplicationContext();
+        Thread thread = new Thread(() -> {
+            AutoSkipService.EpisodeTitleMetadata result = null;
+            try {
+                result = AutoSkipService.fetchEpisodeTitleMetadata(
+                        appContext, title, requestSeason, requestEpisode);
+            } catch (Exception e) {
+                android.util.Log.w("AuroraTitle", "Episode metadata request failed", e);
+            }
+            final AutoSkipService.EpisodeTitleMetadata metadata = result;
+            mainHandler.post(() -> {
+                if (!requestSignature.equals(episodeTitleRequestSignature)) return;
+                episodeTitleRequestPending = false;
+                episodeTitleRetryAt = metadata == null ? System.currentTimeMillis() + 30000 : 0;
+                if (metadata == null || !metadata.episodic) {
+                    android.util.Log.i("AuroraTitle", metadata == null
+                            ? "Metadata unavailable; retry in 30s" : "Movie: episode overlay omitted");
+                    episodeTitleEligible = false;
+                    episodeTitleHideAt = 0;
+                    episodeTitleText = "";
+                    mainHandler.removeCallbacks(HIDE_EPISODE_TITLE_TASK);
+                    applyEpisodeTitleText();
+                    updateEpisodeTitleVisibility();
+                    return;
+                }
+                episodeTitleEligible = true;
+                android.util.Log.i("AuroraTitle", "Episode title ready S" + requestSeason + "E" + requestEpisode);
+                episodeTitleText = TextUtils.isEmpty(metadata.title)
+                        ? requestBaseText : requestBaseText + " " + metadata.title;
+                applyEpisodeTitleText();
+                showEpisodeTitleAfterChange();
+                if (metadata.tmdbId > 0) {
+                    WeakReference<Activity> owner = new WeakReference<>(activity);
+                    SeriesLogoCache.request(appContext, metadata.tmdbId, bitmap -> {
+                        Activity current = owner.get();
+                        if (current == null || current.isFinishing() || current.isDestroyed()
+                                || !requestSignature.equals(episodeTitleRequestSignature)) return;
+                        episodeTitleLogo = bitmap;
+                        applyEpisodeTitleText();
+                        updateEpisodeTitleVisibility();
+                        android.util.Log.i("AuroraTitle", bitmap == null
+                                ? "Chinese logo unavailable; keep series text" : "Chinese series logo applied");
+                    });
+                }
+            });
+        }, "DanmakuEpisodeTitle");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private static String buildEpisodeTitleText(EpisodeInfo info) {
+        if (info == null) return "";
+        String series = !TextUtils.isEmpty(info.getSeriesName())
+                ? info.getSeriesName()
+                : (info.getEpisodeNames() != null && !info.getEpisodeNames().isEmpty()
+                ? info.getEpisodeNames().get(0) : "");
+        int episodeNumber = MediaIdentityResolver.parseEpisodeNumber(info.getEpisodeNum());
+        String episode = episodeNumber > 0
+                ? "第" + episodeNumber + "集"
+                : (TextUtils.isEmpty(info.getEpisodeNum()) ? "" : info.getEpisodeNum().trim());
+        if (TextUtils.isEmpty(series)) return episode;
+        if (TextUtils.isEmpty(episode)) return series;
+        return series + "\n           " + episode;
+    }
+
+    private static void applyEpisodeTitleText() {
+        TextView view = episodeTitleOverlay.get();
+        if (view == null) return;
+        if (TextUtils.isEmpty(episodeTitleText)) {
+            view.setText("");
+            return;
+        }
+        SpannableStringBuilder styledText = new SpannableStringBuilder(episodeTitleText);
+        int titleLineStart = episodeTitleText.indexOf('\n');
+        if (titleLineStart < 0) {
+            styledText.setSpan(new RelativeSizeSpan(EPISODE_TITLE_LINE_SCALE),
+                    0, styledText.length(), SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+        } else {
+            if (episodeTitleLogo != null) {
+                android.graphics.drawable.BitmapDrawable logo = new android.graphics.drawable.BitmapDrawable(
+                        view.getResources(), episodeTitleLogo);
+                // Fixed pixel box; preserve lettering proportions and align it to the left.
+                int maxWidth = Math.min(EPISODE_TITLE_LOGO_WIDTH_PX,
+                        Math.max(1, view.getResources().getDisplayMetrics().widthPixels * 60 / 100));
+                int availableWidth = view.getWidth() - view.getPaddingLeft() - view.getPaddingRight();
+                if (availableWidth > 0) maxWidth = Math.min(maxWidth, availableWidth);
+                int maxHeight = EPISODE_TITLE_LOGO_HEIGHT_PX;
+                float scale = Math.min((float) maxWidth / episodeTitleLogo.getWidth(),
+                        (float) maxHeight / episodeTitleLogo.getHeight());
+                int width = Math.max(1, Math.min(maxWidth, Math.round(episodeTitleLogo.getWidth() * scale)));
+                int height = Math.max(1, Math.min(maxHeight, Math.round(episodeTitleLogo.getHeight() * scale)));
+                int top = (maxHeight - height) / 2;
+                android.graphics.drawable.InsetDrawable box = new android.graphics.drawable.InsetDrawable(
+                        logo, 0, top, maxWidth - width, maxHeight - height - top);
+                box.setBounds(0, 0, maxWidth, maxHeight);
+                styledText.setSpan(new ImageSpan(box, ImageSpan.ALIGN_BOTTOM),
+                        0, titleLineStart, SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else {
+                styledText.setSpan(new RelativeSizeSpan(EPISODE_TITLE_LINE_SCALE),
+                        0, titleLineStart, SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            styledText.setSpan(new RelativeSizeSpan(EPISODE_TITLE_NAME_SCALE),
+                    titleLineStart + 1, styledText.length(),
+                    SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        view.setText(styledText);
+    }
+
+    private static void updateEpisodeTitlePlaybackState(Media media) {
+        if (media == null || media.getState() == null) return;
+        boolean paused = media.getState() == 2;
+        if (paused == episodeTitlePaused) return;
+        episodeTitlePaused = paused;
+        if (paused) episodeTitleToolbarSuppressed = false;
+        mainHandler.post(DanmakuScanner::updateEpisodeTitleVisibility);
+    }
+
+    private static void showEpisodeTitleAfterChange() {
+        if (!episodeTitleEligible || TextUtils.isEmpty(episodeTitleText)) {
+            updateEpisodeTitleVisibility();
+            return;
+        }
+        episodeTitleToolbarSuppressed = false;
+        episodeTitleHideAt = System.currentTimeMillis() + EPISODE_TITLE_VISIBLE_MS;
+        mainHandler.removeCallbacks(HIDE_EPISODE_TITLE_TASK);
+        updateEpisodeTitleVisibility();
+        mainHandler.postDelayed(HIDE_EPISODE_TITLE_TASK, EPISODE_TITLE_VISIBLE_MS);
+    }
+
+    private static void updateEpisodeTitleVisibility() {
+        TextView view = episodeTitleOverlay.get();
+        if (view == null) return;
+        boolean visible = episodeTitleEligible
+                && !TextUtils.isEmpty(episodeTitleText)
+                && !episodeTitleToolbarSuppressed
+                && (episodeTitleToolbarVisible
+                || episodeTitlePaused
+                || System.currentTimeMillis() < episodeTitleHideAt);
+        int visibility = visible ? View.VISIBLE : View.GONE;
+        if (view.getVisibility() != visibility) {
+            view.setVisibility(visibility);
+            if (visible && view.getParent() instanceof ViewGroup) {
+                view.bringToFront();
+            }
+        }
+    }
+
+    private static boolean isEpisodeTitleToolbarVisible(View control) {
+        if (control == null || !control.isShown()) return false;
+        View current = control;
+        while (current != null) {
+            if (current.getVisibility() != View.VISIBLE || current.getAlpha() <= 0.01f) {
+                return false;
+            }
+            ViewParent parent = current.getParent();
+            current = parent instanceof View ? (View) parent : null;
+        }
+        android.graphics.Rect visibleRect = new android.graphics.Rect();
+        return control.getGlobalVisibleRect(visibleRect)
+                && visibleRect.width() > 0 && visibleRect.height() > 0;
+    }
+
+    private static void startEpisodeTitleVisibilityWatcher(View control) {
+        episodeTitleControl = new WeakReference<>(control);
+        updateEpisodeTitleToolbarVisibility(isEpisodeTitleToolbarVisible(control));
+        if (episodeTitleVisibilityWatcherRunning) return;
+        episodeTitleVisibilityWatcherRunning = true;
+        mainHandler.post(EPISODE_TITLE_VISIBILITY_WATCHER);
+    }
+
+    private static void updateEpisodeTitleToolbarVisibility(boolean visible) {
+        if (visible == episodeTitleToolbarVisible) return;
+        episodeTitleToolbarVisible = visible;
+        episodeTitleToolbarSuppressed = !visible;
+        updateEpisodeTitleVisibility();
+    }
+
+    private static void hideEpisodeTitleOverlay() {
+        episodeTitleEligible = false;
+        episodeTitleToolbarVisible = false;
+        episodeTitleToolbarSuppressed = false;
+        episodeTitlePaused = false;
+        episodeTitleHideAt = 0;
+        episodeTitleText = "";
+        episodeTitleRequestSignature = "";
+        episodeTitleLogo = null;
+        episodeTitleRetryAt = 0;
+        episodeTitleRequestPending = false;
+        episodeTitleControl = new WeakReference<>(null);
+        episodeTitleVisibilityWatcherRunning = false;
+        mainHandler.removeCallbacks(HIDE_EPISODE_TITLE_TASK);
+        mainHandler.removeCallbacks(EPISODE_TITLE_VISIBILITY_WATCHER);
+        mainHandler.post(() -> {
+            TextView view = episodeTitleOverlay.get();
+            if (view != null) view.setVisibility(View.GONE);
+        });
+    }
+
+    private static void ensureEpisodeTitleOverlay(ViewGroup toolbarRow) {
+        if (toolbarRow == null) return;
+        Context titleContext = toolbarRow.getContext();
+        while (titleContext instanceof android.content.ContextWrapper && !(titleContext instanceof Activity)) {
+            Context base = ((android.content.ContextWrapper)titleContext).getBaseContext();
+            if (base == titleContext) break;
+            titleContext = base;
+        }
+        if (!(titleContext instanceof Activity)) return;
+        final Activity titleActivity = (Activity)titleContext;
+        try {
+            ViewParent scrollParent = toolbarRow.getParent();
+            View scroll = scrollParent instanceof View ? (View) scrollParent : toolbarRow;
+            ViewParent controlParent = scroll instanceof ViewGroup
+                    ? ((ViewGroup) scroll).getParent() : null;
+            View control = controlParent instanceof View ? (View) controlParent : toolbarRow;
+            View parent = null;
+            ViewParent outerParent = control.getParent();
+            while (outerParent instanceof View) {
+                View ancestor = (View) outerParent;
+                if (ancestor instanceof FrameLayout) {
+                    parent = ancestor;
+                    break;
+                }
+                outerParent = ancestor.getParent();
+            }
+            if (!(parent instanceof FrameLayout)) return;
+
+            final ViewGroup overlayHost = (ViewGroup) parent;
+            final View controlFrame = control;
+            final View toolbarBar = scroll instanceof ViewGroup ? scroll : toolbarRow;
+            TextView cached = episodeTitleOverlay.get();
+            if (cached != null && cached.getParent() == overlayHost) {
+                startEpisodeTitleVisibilityWatcher(controlFrame);
+                updateEpisodeTitleVisibility();
+                return;
+            }
+            View root = toolbarRow.getRootView();
+            View existing = root == null ? null : root.findViewWithTag(EPISODE_TITLE_TAG);
+
+            TextView titleView;
+            if (existing instanceof TextView && existing.getParent() == overlayHost) {
+                titleView = (TextView) existing;
+            } else {
+                if (existing != null && existing.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) existing.getParent()).removeView(existing);
+                }
+                Activity activity = titleActivity;
+                titleView = new TextView(activity);
+                titleView.setTag(EPISODE_TITLE_TAG);
+                titleView.setTextColor(Color.WHITE);
+                titleView.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+                        EPISODE_TITLE_BASE_SIZE_SP);
+                titleView.setTypeface(null, android.graphics.Typeface.BOLD);
+                titleView.setSingleLine(false);
+                titleView.setMaxLines(2);
+                titleView.setEllipsize(TextUtils.TruncateAt.END);
+                titleView.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+                titleView.setPadding(0, 0, 0, 0);
+                titleView.setAlpha(EPISODE_TITLE_ALPHA);
+                titleView.setShadowLayer(dpToPx(activity, 4), 0, dpToPx(activity, 2),
+                        0xDD000000);
+                titleView.setFocusable(false);
+                titleView.setClickable(false);
+                titleView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                titleView.setBackground(null);
+                titleView.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+                    if (r - l != or - ol && episodeTitleOverlay.get() == v
+                            && episodeTitleLogo != null) applyEpisodeTitleText();
+                });
+
+                FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                params.gravity = Gravity.BOTTOM | Gravity.START;
+                overlayHost.addView(titleView, params);
+                controlFrame.addOnLayoutChangeListener((v, left, top, right, bottom,
+                                                        oldLeft, oldTop, oldRight, oldBottom) ->
+                        updateEpisodeTitleOverlayPosition(
+                                overlayHost, titleView, controlFrame, toolbarBar));
+                if (toolbarBar != controlFrame) toolbarBar.addOnLayoutChangeListener(
+                        (v, l, t, r, b, ol, ot, or, ob) -> updateEpisodeTitleOverlayPosition(
+                                overlayHost, titleView, controlFrame, toolbarBar));
+            }
+
+            episodeTitleOverlay = new WeakReference<>(titleView);
+            applyEpisodeTitleText();
+            startEpisodeTitleVisibilityWatcher(controlFrame);
+            updateEpisodeTitleVisibility();
+            updateEpisodeTitleOverlayPosition(overlayHost, titleView, controlFrame, toolbarBar);
+        } catch (Exception e) {
+            DanmakuSpider.log("集标题浮层创建失败: " + e.getMessage());
+        }
+    }
+
+    private static void updateEpisodeTitleOverlayPosition(ViewGroup host, TextView titleView,
+                                                          View controlFrame, View toolbarBar) {
+        host.post(() -> {
+            try {
+                if (titleView.getParent() != host || controlFrame.getWidth() <= 0
+                        || host.getHeight() <= 0 || toolbarBar.getWidth() <= 0) return;
+
+                int[] hostLocation = new int[2];
+                int[] controlLocation = new int[2];
+                int[] barLocation = new int[2];
+                host.getLocationOnScreen(hostLocation);
+                controlFrame.getLocationOnScreen(controlLocation);
+                toolbarBar.getLocationOnScreen(barLocation);
+
+                int width = Math.max(0, toolbarBar.getWidth());
+                int leftMargin = Math.max(0, barLocation[0] - hostLocation[0]);
+                int controlTop = controlLocation[1] - hostLocation[1];
+                int bottomMargin = Math.max(dpToPx(host.getContext(), 6),
+                        host.getHeight() - controlTop + dpToPx(host.getContext(), 6));
+                FrameLayout.LayoutParams current = titleView.getLayoutParams()
+                        instanceof FrameLayout.LayoutParams
+                        ? (FrameLayout.LayoutParams) titleView.getLayoutParams() : null;
+                if (current == null || current.width != width
+                        || current.leftMargin != leftMargin
+                        || current.bottomMargin != bottomMargin
+                        || current.gravity != (Gravity.BOTTOM | Gravity.START)) {
+                    FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                            width, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    params.gravity = Gravity.BOTTOM | Gravity.START;
+                    params.leftMargin = leftMargin;
+                    params.bottomMargin = bottomMargin;
+                    titleView.setLayoutParams(params);
+                }
+
+                updateEpisodeTitleVisibility();
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
+    private static int dpToPx(android.content.Context context, int dp) {
+        return Math.round(dp * context.getResources().getDisplayMetrics().density);
     }
 
     private static void addToolbarButton(ViewGroup parent, List<View> ordered,
@@ -1532,6 +2011,10 @@ public class DanmakuScanner {
      * @param activity
      */
     public static void showLeoButtonMenu(final Activity activity) {
+        showLeoButtonMenu(activity, null);
+    }
+
+    public static void showLeoButtonMenu(final Activity activity, Runnable onDismiss) {
         try {
             android.app.AlertDialog.Builder builder = new android.app.AlertDialog.Builder(activity);
             builder.setTitle("弹幕设置");
@@ -1656,12 +2139,18 @@ public class DanmakuScanner {
             builder.setNegativeButton("取消", null);
 
             try {
-                builder.show();
+                android.app.AlertDialog menu = builder.create();
+                menu.setOnDismissListener(ignored -> {
+                    if (onDismiss != null) onDismiss.run();
+                });
+                menu.show();
             } catch (Exception e) {
                 DanmakuSpider.log("显示菜单失败: " + e.getMessage());
+                if (onDismiss != null) onDismiss.run();
             }
         } catch (Exception e) {
             DanmakuSpider.log("创建菜单失败: " + e.getMessage());
+            if (onDismiss != null) onDismiss.run();
         }
     }
 

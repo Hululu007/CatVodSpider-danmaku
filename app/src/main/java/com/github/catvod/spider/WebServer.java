@@ -45,6 +45,10 @@ public class WebServer extends NanoHTTPD {
         if (uri.equals("/")) {
             DanmakuUIHelper.dismissQRCodeDialog();
             return newFixedLengthResponse(getSettingsChooserHtml());
+        } else if (uri.equals("/toolbar-settings")) {
+            return newFixedLengthResponse(getToolbarSettingsHtml());
+        } else if (uri.equals("/save-toolbar-settings")) {
+            return handleToolbarSettingsSave(session);
         } else if (uri.equals("/remote-search")) {
             DanmakuUIHelper.dismissQRCodeDialog();
             return newFixedLengthResponse(getHtml());
@@ -139,6 +143,41 @@ public class WebServer extends NanoHTTPD {
         }
     }
 
+    private Response handleToolbarSettingsSave(IHTTPSession session) {
+        try {
+            if (session.getMethod() != Method.POST) return newFixedLengthResponse(
+                    Response.Status.METHOD_NOT_ALLOWED, MIME_PLAINTEXT, "POST required");
+            session.parseBody(new HashMap<>());
+            Map<String, String> params = session.getParms();
+            if (!SETTINGS_TOKEN.equals(params.get("token"))) return newFixedLengthResponse(
+                    Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Invalid settings token");
+            String mode = params.get("mode");
+            if (!"legacy".equals(mode) && !"custom".equals(mode)) return newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Invalid toolbar mode");
+            android.content.Context context = Init.context();
+            if (context == null) return newFixedLengthResponse(Response.Status.INTERNAL_ERROR,
+                    MIME_PLAINTEXT, "Application unavailable");
+            PlayerToolbarController.setMode(context, mode);
+            return newFixedLengthResponse(Response.Status.OK, MIME_HTML,
+                    renderMessagePage("已保存", "custom".equals(mode)
+                            ? "已选择新版功能栏。播放页自动应用；未识别布局保留原界面。"
+                            : "已恢复旧版功能栏。此选择保存在本机，不会被订阅覆盖。", true));
+        } catch (Exception e) {
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Save failed");
+        }
+    }
+
+    private String getToolbarSettingsHtml() {
+        return "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+                + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<title>播放器功能栏</title><style>body{background:#101522;color:#eef6ff;font:16px sans-serif;padding:24px}"
+                + "main{max-width:600px;margin:auto}button{display:block;margin:18px 0;padding:16px;border:0;border-radius:12px;background:#2585ff;color:white;width:100%}p{line-height:1.7}</style>"
+                + "<main><h1>播放器功能栏</h1><p>新版采用玻璃主栏；弹幕搜索与章节保留原样。随时可以恢复旧版。</p>"
+                + "<form method='post' action='/save-toolbar-settings'><input type='hidden' name='token' value='" + SETTINGS_TOKEN + "'>"
+                + "<button name='mode' value='custom'>使用新版功能栏</button>"
+                + "<button name='mode' value='legacy'>恢复旧版功能栏</button></form><a href='/'>返回设置</a></main></html>";
+    }
+
     private Response handleAutoSettingsSave(IHTTPSession session) {
         try {
             Map<String, String> files = new HashMap<>();
@@ -197,6 +236,7 @@ public class WebServer extends NanoHTTPD {
                 + "text-align:center}.blue{background:#2f6fed}.green{background:#238b63}p{color:#9fb0cc}</style>"
                 + "</head><body><div class='card'><h1>弹幕工具</h1>"
                 + "<p>搜索并推送弹幕，或修改相关配置。</p>"
+                + "<a class='blue' href='/toolbar-settings'>播放器功能栏</a>"
                 + "<a href='/remote-search'>弹幕搜索</a>"
                 + "<a class='blue' href='/api-settings'>弹幕搜索 API</a>"
                 + "<a class='green' href='/tmdb-settings'>TMDB Key</a></div></body></html>";

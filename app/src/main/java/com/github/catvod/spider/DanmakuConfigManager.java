@@ -12,6 +12,7 @@ public class DanmakuConfigManager {
     private static final String KEY_DEFAULT_API_MIGRATED = "default_api_migrated_v1";
     private static final String KEY_AUTO_ENABLED_MIGRATED = "auto_enabled_migrated_v2";
     private static final String KEY_AURORA_STYLE_MIGRATED = "aurora_style_migrated_v5";
+    private static final String KEY_TOOLBAR_DEFAULT_MIGRATED = "toolbar_custom_default_v2";
 
     // 旧的配置键，用于迁移
     private static final String OLD_KEY_API_URLS = "api_urls";
@@ -36,6 +37,15 @@ public class DanmakuConfigManager {
         String json = prefs.getString(KEY_CONFIG_JSON, null);
         if (json != null) {
             DanmakuConfig config = normalize(gson.fromJson(json, DanmakuConfig.class));
+            if (!prefs.getBoolean(KEY_TOOLBAR_DEFAULT_MIGRATED, false)) {
+                // Upgrade the former default once. Explicit local rollback remains authoritative
+                // in PlayerToolbarController.mode(), and diagnose remains opt-in.
+                if (!DanmakuConfig.PLAYER_TOOLBAR_MODE_DIAGNOSE.equals(config.getPlayerToolbarMode())) {
+                    config.setPlayerToolbarMode(DanmakuConfig.PLAYER_TOOLBAR_MODE_CUSTOM);
+                }
+                prefs.edit().putString(KEY_CONFIG_JSON, gson.toJson(config))
+                        .putBoolean(KEY_TOOLBAR_DEFAULT_MIGRATED, true).apply();
+            }
             if (!prefs.getBoolean(KEY_DEFAULT_API_MIGRATED, false)) {
                 config.getApiUrls().add(DanmakuConfig.DEFAULT_DANMAKU_API_URL);
                 prefs.edit()
@@ -68,7 +78,12 @@ public class DanmakuConfigManager {
         sDanmakuConfig = config;
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         String json = gson.toJson(config);
-        prefs.edit().putString(KEY_CONFIG_JSON, json).apply();
+        String previous = prefs.getString(KEY_CONFIG_JSON, null);
+        DanmakuConfig before = previous == null ? null : gson.fromJson(previous, DanmakuConfig.class);
+        prefs.edit().putString(KEY_CONFIG_JSON, json)
+                .putBoolean(KEY_AUTO_ENABLED_MIGRATED, true).apply();
+        if (before != null && before.isAutoSkipEnabled() != config.isAutoSkipEnabled())
+            ChapterManager.onAutoSkipChanged(config.isAutoSkipEnabled());
     }
 
     private static DanmakuConfig normalize(DanmakuConfig config) {
@@ -82,6 +97,8 @@ public class DanmakuConfigManager {
             config.setTmdbLanguage("zh-CN");
         }
         config.setDanmakuStyle(DanmakuConfig.DEFAULT_DANMAKU_STYLE);
+        config.setPlayerToolbarMode(config.getPlayerToolbarMode());
+        config.setSeriesLogoCacheMb(config.getSeriesLogoCacheMb());
         return config;
     }
 
@@ -117,6 +134,7 @@ public class DanmakuConfigManager {
                 .putBoolean(KEY_DEFAULT_API_MIGRATED, true)
                 .putBoolean(KEY_AUTO_ENABLED_MIGRATED, true)
                 .putBoolean(KEY_AURORA_STYLE_MIGRATED, true)
+                .putBoolean(KEY_TOOLBAR_DEFAULT_MIGRATED, true)
                 .apply();
 
         DanmakuSpider.log("旧配置已成功迁移到新格式。");

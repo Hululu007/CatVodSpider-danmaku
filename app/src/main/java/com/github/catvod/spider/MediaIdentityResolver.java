@@ -33,6 +33,18 @@ public final class MediaIdentityResolver {
     private static final Pattern VERSION_PATTERN = Pattern.compile(
             "(?i)(?<![A-Za-z0-9])(?:V|VER)\\.?\\s*\\d+(?:\\.\\d+)?(?![A-Za-z0-9])"
     );
+    private static final Pattern AUDIO_LAYOUT_PATTERN = Pattern.compile(
+            "(?i)(?:(?<![A-Za-z0-9])(?:DTS(?:[ ._-]?(?:HD|MA|HRA|X))*|"
+                    + "TRUE[ ._-]?HD|DOLBY(?:[ ._-]?(?:DIGITAL|PLUS|ATMOS))*|"
+                    + "E[ ._-]?AC[ ._-]?3|AC[ ._-]?3|DDP|DD\\+?|AAC|FLAC|ATMOS)"
+                    + "[ ._-]*[1-9]\\.[0-9](?:\\.[0-9])?|"
+                    + "(?<![A-Za-z0-9])(?:1\\.0|2\\.[01]|[5679]\\.1)(?:\\.[24])?)(?![0-9])"
+    );
+    private static final Pattern TECHNICAL_NUMBER_PATTERN = Pattern.compile(
+            "(?i)(?<![A-Za-z0-9])[0-9]+(?:\\.[0-9]+)?[ ._-]*"
+                    + "(?:BITS?|FPS|帧|KHZ|MHZ|HZ|KBPS|MBPS|CH(?:ANNELS)?|声道|AUDIOS?|音轨)"
+                    + "(?![A-Za-z0-9])"
+    );
     private static final Pattern SEASON_EPISODE_PATTERN = Pattern.compile(
             "(?i)(?<![A-Za-z0-9])(?:S(?:eason)?\\s*(\\d{1,2}))?[ ._-]*"
                     + "E(?:P(?:ISODE)?)?\\s*(\\d{1,4})(?![0-9])"
@@ -84,6 +96,10 @@ public final class MediaIdentityResolver {
             "(?i)\\.(?:mp4|mkv|avi|rmvb|flv|ts|m3u8|webm)$"
     );
     private static final Pattern FIRST_NUMBER_PATTERN = Pattern.compile("([0-9]+)");
+    private static final Pattern EXTRA_VIDEO_PATTERN = Pattern.compile(
+            "采访|访谈|花絮|彩蛋|预告|先导片|特辑|制作特辑|幕后|番外|特别篇|"
+                    + "(?i)\\b(?:trailer|teaser|interview|behind[ ._-]+the[ ._-]+scenes|special|ova|oad)\\b"
+    );
 
     private MediaIdentityResolver() {
     }
@@ -149,7 +165,7 @@ public final class MediaIdentityResolver {
 
         String episodeToken = extractEpisodeToken(episodeSource);
         if (isEmpty(episodeToken)) episodeToken = extractEpisodeToken(title);
-        if (isEmpty(episodeToken)) episodeToken = extractEpisodeToken(urlFileName);
+        if (isEmpty(episodeToken)) episodeToken = extractUrlEpisodeToken(rawUrl);
 
         int episode = firstNumber(episodeToken);
         if (episode <= 0) {
@@ -276,6 +292,31 @@ public final class MediaIdentityResolver {
         return firstNumber(extractEpisodeToken(value));
     }
 
+    /** Provider lists mix episodes with numbered interviews, trailers and bonus clips. */
+    public static int parseDanmakuEpisodeNumber(String value) {
+        String title = cleanSearchText(value);
+        Matcher extra = EXTRA_VIDEO_PATTERN.matcher(title);
+        if (extra.find()) {
+            int episodeMarker = Integer.MAX_VALUE;
+            int episodeEnd = -1;
+            Matcher chinese = CHINESE_EPISODE_PATTERN.matcher(title);
+            Matcher western = SEASON_EPISODE_PATTERN.matcher(title);
+            if (chinese.find()) {
+                episodeMarker = chinese.start();
+                episodeEnd = chinese.end();
+            }
+            if (western.find() && western.start() < episodeMarker) {
+                episodeMarker = western.start();
+                episodeEnd = western.end();
+            }
+            // Words in the episode synopsis after "第2集" do not make it a bonus video.
+            if (extra.start() < episodeMarker) return 0;
+            if (episodeEnd >= 0 && extra.start() >= episodeEnd
+                    && title.substring(episodeEnd, extra.start()).matches("[\\s:：._-]*")) return 0;
+        }
+        return parseEpisodeNumber(title);
+    }
+
     public static int parseSeasonNumber(String value) {
         return extractSeasonNumber(value);
     }
@@ -300,6 +341,13 @@ public final class MediaIdentityResolver {
     public static String normalizeForCompare(String value) {
         if (value == null) return "";
         return value.toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}]", "");
+    }
+
+    /** Remove invisible formatting and normalize spaces before querying providers. */
+    public static String cleanSearchText(String value) {
+        if (value == null) return "";
+        return value.replaceAll("\\p{Cf}", "")
+                .replaceAll("[\\p{Z}\\s]+", " ").trim();
     }
 
     public static String extractYear(String value) {
@@ -372,12 +420,15 @@ public final class MediaIdentityResolver {
 
     private static String preprocessEpisodeText(String value) {
         String processed = stripPlayingPrefix(value);
+        // Strip complete technical tokens before codec cleanup leaves their numbers behind.
+        processed = AUDIO_LAYOUT_PATTERN.matcher(processed).replaceAll(" ");
+        processed = TECHNICAL_NUMBER_PATTERN.matcher(processed).replaceAll(" ");
         processed = SIZE_PATTERN.matcher(processed).replaceAll(" ");
         processed = QUALITY_PATTERN.matcher(processed).replaceAll(" ");
         processed = VERSION_PATTERN.matcher(processed).replaceAll(" ");
         processed = EXTENSION_PATTERN.matcher(processed).replaceAll(" ");
         processed = processed.replaceAll("\\s+", " ").trim();
-        return isEmpty(processed) ? value : processed;
+        return processed;
     }
 
     private static boolean isLikelyFileSize(String title, int numberStart, int numberEnd) {
@@ -476,7 +527,7 @@ public final class MediaIdentityResolver {
 
     private static void addAlias(Set<String> aliases, String value) {
         if (isEmpty(value)) return;
-        String alias = value.trim();
+        String alias = cleanSearchText(value);
         if (alias.length() < 2) return;
         String normalized = normalizeForCompare(alias);
         if (normalized.length() < 2) return;
@@ -502,9 +553,23 @@ public final class MediaIdentityResolver {
         return stripExtension(path);
     }
 
+    private static String extractUrlEpisodeToken(String url) {
+        if (isEmpty(url)) return "";
+        String path = url.split("[?#]", 2)[0];
+        String name = path.substring(path.lastIndexOf('/') + 1);
+        String stem = stripExtension(name);
+        // Playback/proxy URLs commonly end in opaque resource IDs, not video filenames.
+        if (stem.matches("[A-Za-z0-9_-]{16,}")) return "";
+        if (EXTENSION_PATTERN.matcher(name).find()
+                || name.matches("(?i)(?:S\\d{1,2})?E(?:P)?\\d{1,4}")
+                || name.matches("第[零一二三四五六七八九十百千万0-9]+[集话章节回期]")) {
+            return extractEpisodeToken(stem);
+        }
+        return "";
+    }
+
     private static String stripPlayingPrefix(String value) {
-        if (value == null) return "";
-        String result = value.trim();
+        String result = cleanSearchText(value);
         if (result.startsWith("正在播放：")) result = result.substring("正在播放：".length());
         return result.trim();
     }

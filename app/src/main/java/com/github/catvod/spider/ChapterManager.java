@@ -33,10 +33,11 @@ public final class ChapterManager {
 
     private static final String PREFS_NAME = "danmaku_chapter_data";
     private static final String KEY_PREFIX = "chapter_";
-    private static final int AUTO_MARKER_VERSION = 2;
+    private static final int AUTO_MARKER_VERSION = 5;
     private static final long AUTO_QUERY_RETRY_MS = 15000L;
-    private static final long POSITION_GRACE_MS = 12000L;
-    private static final long BACKWARD_JUMP_THRESHOLD_MS = 10000L;
+    private static volatile long playbackGeneration;
+    private static volatile String sessionMediaKey = "";
+    private static volatile String sessionMediaUrl = "";
     private static final Object AUTO_QUERY_LOCK = new Object();
     private static final Gson GSON = new Gson();
     private static final ScheduledExecutorService AUTO_SKIP_EXECUTOR =
@@ -48,15 +49,15 @@ public final class ChapterManager {
 
     private static volatile WeakReference<Activity> activityRef = new WeakReference<>(null);
     private static volatile boolean autoSkipStarted;
-    private static volatile String lastMediaKey = "";
-    private static volatile String lastSkipType = "";
-    private static volatile long lastSkipAt;
-    private static volatile long lastSkipAttemptAt;
-    private static volatile boolean introSkipDoneForMedia;
+    // Memory only. A completed action belongs to this playback, never the next one.
+    static final class SkipSession {
+        volatile boolean introDone;
+        volatile boolean outroDone;
+        long lastAttemptAt;
+    }
+
+    private static volatile SkipSession skipSession = new SkipSession();
     private static volatile String observedMediaKey = "";
-    private static volatile long observedPositionMs = -1;
-    private static volatile long observedAtMs;
-    private static volatile long observedMediaSince;
     private static volatile long suppressAutoSkipUntil;
     private static volatile MediaInfo lastPlaybackInfo;
     private static volatile String lastAutoQueryKey = "";
@@ -83,6 +84,7 @@ public final class ChapterManager {
     }
 
     public static class ChapterData {
+        public int automaticOnlyVersion;
         public boolean autoIntro;
         public boolean autoEnding;
         public boolean manualIntroOverride;
@@ -99,6 +101,9 @@ public final class ChapterManager {
         public long nativeOpeningWrittenMs = -1;
         public long nativeEndingWrittenMs = -1;
         public List<Chapter> chapters = new ArrayList<>();
+        public List<Chapter> providerChapters = new ArrayList<>();
+        public long markerDurationMs;
+        public long markerRetryAtMs;
     }
 
     public static class MediaInfo {
@@ -110,6 +115,9 @@ public final class ChapterManager {
         public String url;
         public long positionMs;
         public long durationMs;
+        public float speed = 1f;
+        public boolean playing;
+        public String positionSource = "host";
 
         public String getDisplayTitle() {
             if (!TextUtils.isEmpty(title) && !TextUtils.isEmpty(artist)) return title + " · " + artist;
@@ -138,7 +146,7 @@ public final class ChapterManager {
 
     private static MediaInfo getNativeMediaInfo() {
         MediaInfo info = FongMiNativeHelper.getMediaInfo(activityRef.get());
-        if (info != null) lastPlaybackInfo = info;
+        if (info != null) { info.positionSource = "session"; lastPlaybackInfo = info; }
         return info;
     }
 
@@ -167,8 +175,13 @@ public final class ChapterManager {
 
     public static MediaInfo fromMedia(Media media) {
         if (media == null) return null;
-        return fromPlaybackValues(media.getTitle(), media.getArtist(), media.getUrl(),
+        MediaInfo info = fromPlaybackValues(media.getTitle(), media.getArtist(), media.getUrl(),
                 media.getPosition(), media.getDuration());
+        if (info != null) {
+            info.speed = media.getSpeed() > 0 ? media.getSpeed() : 1f;
+            info.playing = media.getState() != null && media.getState() == 3;
+        }
+        return info;
     }
 
     public static MediaInfo fromPlaybackValues(
@@ -215,6 +228,18 @@ public final class ChapterManager {
         }
         if (data == null) data = new ChapterData();
         if (data.chapters == null) data.chapters = new ArrayList<>();
+        if (data.providerChapters == null) data.providerChapters = new ArrayList<>();
+        if (media != null && data.markerDurationMs > 0 && media.durationMs > 0
+                && Math.abs(data.markerDurationMs - media.durationMs) > SkipSegmentSources.DURATION_TOLERANCE_MS) {
+            data.introStartMs = -1; data.introEndMs = -1; data.outroStartMs = -1;
+            data.recapStartMs = -1; data.recapEndMs = -1;
+            data.autoIntro = false; data.autoEnding = false;
+            data.autoIntroResolved = false; data.autoOutroResolved = false;
+            data.autoMarkerVersion = 0; data.markerDurationMs = 0;
+            data.providerChapters.clear();
+            migrated = true;
+        }
+        migrated |= migrateAutomaticOnly(data);
         if (migrated && context != null && media != null) {
             saveData(context, media, data);
         }
@@ -227,75 +252,50 @@ public final class ChapterManager {
         prefs.edit().putString(KEY_PREFIX + media.key, GSON.toJson(data)).apply();
     }
 
-    public static void setMarker(Context context, MediaInfo media, ChapterData data, String type, long positionMs) {
-        if (data == null || media == null) return;
-        long value = Math.max(0, positionMs);
-        if ("introStart".equals(type)) {
-            data.introStartMs = value;
-            data.manualIntroOverride = true;
+    /** Old versions imported manual History values into provider fields. Discard only those sides. */
+    static boolean migrateAutomaticOnly(ChapterData data) {
+        if (data.automaticOnlyVersion >= 1) return false;
+        if (data.manualIntroOverride) {
+            data.introStartMs = -1; data.introEndMs = -1;
+            data.autoIntro = false; data.autoIntroResolved = false;
         }
-        else if ("introEnd".equals(type)) {
-            data.introEndMs = value;
-            if (data.introStartMs < 0 || data.introStartMs >= value) data.introStartMs = 0;
-            data.autoIntro = true;
-            data.manualIntroOverride = true;
-        } else if ("outroStart".equals(type)) {
-            data.outroStartMs = value;
-            data.autoEnding = true;
-            data.manualOutroOverride = true;
+        if (data.manualOutroOverride) {
+            data.outroStartMs = -1; data.autoEnding = false; data.autoOutroResolved = false;
         }
-        saveData(context, media, data);
-        syncNativeHistory(activityRef.get(), media, data);
+        data.manualIntroOverride = false; data.manualOutroOverride = false;
+        data.automaticOnlyVersion = 1;
+        return true;
     }
 
-    public static void clearMarker(Context context, MediaInfo media, ChapterData data, String type) {
-        if (data == null || media == null) return;
-        if ("intro".equals(type) || "introEnd".equals(type) || "introStart".equals(type)) {
-            data.introStartMs = -1;
-            data.introEndMs = -1;
-            data.autoIntro = false;
-            data.manualIntroOverride = true;
-        } else if ("outro".equals(type) || "outroStart".equals(type)) {
-            data.outroStartMs = -1;
-            data.autoEnding = false;
-            data.manualOutroOverride = true;
+    /** Toolbar-only action. Provider markers are never erased by a manual clear. */
+    public static boolean clearManualSkipMarkers(Activity activity) {
+        if (activity == null) return false;
+        boolean cleared = FongMiNativeHelper.clearManualSkipMarkers(activity);
+        if (cleared) {
+            MediaInfo media = lastPlaybackInfo;
+            if (media != null) loadData(activity, media); // Migrate an old mixed record, if present.
+            suppressAutoSkipUntil = System.currentTimeMillis() + 10000;
+            DanmakuSpider.log("已清除原生手动头尾；自动章节保留");
         }
-        saveData(context, media, data);
-        syncNativeHistory(activityRef.get(), media, data);
+        return cleared;
     }
 
-    public interface MarkerCallback {
-        void onComplete(MediaInfo media, ChapterData data, boolean cleared);
+    public static void onAutoSkipChanged(boolean enabled) {
+        Activity activity = activityRef.get();
+        if (activity == null || activity.isFinishing()) return;
+        suppressAutoSkipUntil = System.currentTimeMillis() + 10000;
+        if (!FongMiNativeHelper.syncNativeSkipState(activity, enabled))
+            DanmakuSpider.log("Auto 总开关原生同步待重试");
     }
 
-    public static void recordCurrentMarker(Activity activity, String type, MarkerCallback callback) {
-        updateCurrentMarker(activity, type, false, callback);
+    static boolean isAutoSkipActive() {
+        Activity activity = activityRef.get();
+        DanmakuConfig config = activity == null ? null : DanmakuConfigManager.getConfig(activity);
+        return config != null && config.isAutoSkipEnabled();
     }
 
-    public static void clearCurrentMarker(Activity activity, String type, MarkerCallback callback) {
-        updateCurrentMarker(activity, type, true, callback);
-    }
-
-    private static void updateCurrentMarker(Activity activity, String type, boolean clear,
-                                            MarkerCallback callback) {
-        if (activity == null) return;
-        new Thread(() -> {
-            MediaInfo media = getMediaInfo();
-            if (media == null) {
-                activity.runOnUiThread(() -> Utils.safeShowToast(activity, "无法读取当前播放进度"));
-                return;
-            }
-            ChapterData data = loadData(activity, media);
-            if (clear) clearMarker(activity, media, data, type);
-            else setMarker(activity, media, data, type, media.positionMs);
-            activity.runOnUiThread(() -> {
-                if (callback != null) callback.onComplete(media, data, clear);
-                long marker = "intro".equals(type) || "introEnd".equals(type)
-                        ? data.introEndMs : data.outroStartMs;
-                Utils.safeShowToast(activity, clear ? "已清除标记"
-                        : ("片头片尾标记已保存：" + formatTime(marker)));
-            });
-        }, "DanmakuManualMarker").start();
+    static boolean isAutoSkipActive(SkipSession session) {
+        return session == skipSession && isAutoSkipActive();
     }
 
     public static void addCustomChapter(Context context, MediaInfo media, ChapterData data, String title, long positionMs) {
@@ -363,20 +363,7 @@ public final class ChapterManager {
     }
 
     public static boolean seekToManual(long positionMs) {
-        long target = Math.max(0, positionMs);
-        long now = System.currentTimeMillis();
-        suppressAutoSkipUntil = Math.max(suppressAutoSkipUntil, now + 10000);
-        Activity activity = activityRef.get();
-        MediaInfo media = lastPlaybackInfo;
-        if (activity != null && media != null) {
-            ChapterData data = loadData(activity, media);
-            long endingBoundary = data.outroStartMs;
-            if (endingBoundary > 0 && target >= endingBoundary) {
-                lastSkipType = "ending";
-            }
-            syncNativeHistory(activity, media, data);
-        }
-        return seekTo(target);
+        return seekTo(positionMs);
     }
 
     public static boolean nextEpisode() {
@@ -403,10 +390,46 @@ public final class ChapterManager {
     }
 
     public static void startAutoSkip(Activity activity) {
-        if (activity != null) activityRef = new WeakReference<>(activity);
+        if (activity != null && activityRef.get() != activity) {
+            Activity previous = activityRef.get();
+            if (previous != null) onPlaybackStopped(previous);
+            activityRef = new WeakReference<>(activity);
+            resetPlaybackSession(activity);
+        }
         if (autoSkipStarted) return;
         autoSkipStarted = true;
         AUTO_SKIP_EXECUTOR.scheduleWithFixedDelay(ChapterManager::autoSkipTick, 500, 1000, TimeUnit.MILLISECONDS);
+    }
+
+    public static void onPlaybackStopped(Activity activity) {
+        if (activityRef.get() != activity) return;
+        resetPlaybackSession(activity);
+        activityRef.clear();
+        lastPlaybackInfo = null;
+    }
+
+    private static void resetPlaybackSession(Activity activity) {
+        playbackGeneration++;
+        skipSession = new SkipSession();
+        suppressAutoSkipUntil = 0;
+        sessionMediaKey = ""; sessionMediaUrl = "";
+        observedMediaKey = "";
+        // Keep global Auto and stored markers; renew only the per-playback allowance.
+        FongMiNativeHelper.syncNativeSkipState(activity, true);
+    }
+
+    private static void observePlaybackSession(Activity activity, MediaInfo media) {
+        boolean changed = !TextUtils.isEmpty(sessionMediaKey)
+                && (!TextUtils.equals(sessionMediaKey, media.key)
+                || (isRealMediaUrl(sessionMediaUrl) && isRealMediaUrl(media.url)
+                && !TextUtils.equals(sessionMediaUrl, media.url)));
+        if (changed) resetPlaybackSession(activity);
+        sessionMediaKey = media.key;
+        if (isRealMediaUrl(media.url)) sessionMediaUrl = media.url;
+    }
+
+    private static boolean isRealMediaUrl(String url) {
+        return !TextUtils.isEmpty(url) && !url.startsWith("mediasession:");
     }
 
     static Activity getCurrentActivity() {
@@ -423,11 +446,12 @@ public final class ChapterManager {
         if (config == null || !config.isAutoSkipEnabled()) return;
         MediaInfo info = fromMedia(media);
         if (info == null) return;
+        observePlaybackSession(activity, info);
         lastPlaybackInfo = info;
         ChapterData data = loadData(activity, info);
-        boolean needsData = needsAutoMarkerRefresh(data)
-                || (!data.autoIntroResolved && data.introEndMs < 0 && !data.manualIntroOverride)
-                || (!data.autoOutroResolved && data.outroStartMs < 0 && !data.manualOutroOverride);
+        boolean needsData = needsAutoMarkerRefresh(data, info)
+                || (!data.autoIntroResolved && data.introEndMs < 0)
+                || (!data.autoOutroResolved && data.outroStartMs < 0);
         if (!needsData) return;
         requestAutoMarkersOnce(activity, info, config);
     }
@@ -436,177 +460,62 @@ public final class ChapterManager {
         try {
             Activity activity = activityRef.get();
             if (activity == null || activity.isFinishing()) return;
-            MediaInfo media = getMediaInfo();
-            if (media == null || media.positionMs <= 0) return;
-            lastPlaybackInfo = media;
-            long now = System.currentTimeMillis();
-            boolean manualJump = false;
-            boolean manualBackwardJump = false;
-            boolean inInitialPositionGrace = false;
-            long previousPositionMs = observedPositionMs;
-            if (!TextUtils.equals(observedMediaKey, media.key)) {
-                observedMediaKey = media.key;
-                observedPositionMs = media.positionMs;
-                observedAtMs = now;
-                observedMediaSince = now;
-                suppressAutoSkipUntil = now + 10000;
-            } else if (observedPositionMs >= 0 && observedAtMs > 0) {
-                long elapsed = Math.max(0, now - observedAtMs);
-                long delta = media.positionMs - observedPositionMs;
-                long forwardAllowance = Math.max(12000, elapsed + 5000);
-                inInitialPositionGrace = observedMediaSince > 0
-                        && now - observedMediaSince < POSITION_GRACE_MS;
-                if (delta < -BACKWARD_JUMP_THRESHOLD_MS || delta > forwardAllowance) {
-                    manualJump = true;
-                    manualBackwardJump = delta < -BACKWARD_JUMP_THRESHOLD_MS;
-                    suppressAutoSkipUntil = now + 10000;
-                    lastSkipType = "";
-                    lastSkipAttemptAt = 0;
-                    DanmakuSpider.log("检测到播放位置跳变: "
-                            + formatTime(previousPositionMs) + " -> "
-                            + formatTime(media.positionMs)
-                            + "，10秒内暂停章节自动跳过");
-                }
-                observedPositionMs = media.positionMs;
-                observedAtMs = now;
-            }
-            ChapterData data = loadData(activity, media);
             DanmakuConfig config = DanmakuConfigManager.getConfig(activity);
             boolean autoEnabled = config != null && config.isAutoSkipEnabled();
-            FongMiNativeHelper.HistoryState nativeHistory =
-                    FongMiNativeHelper.readHistory(activity);
-            if (nativeHistory.available) {
-                long nativeIntro = nativeHistory.opening;
-                long nativeOutro = nativeEndingToOutroStart(
-                        media.durationMs, nativeHistory.ending);
-                boolean changed = false;
-                boolean hasLocalIntro = data.introEndMs > 0
-                        && (data.autoIntro || data.manualIntroOverride);
-                boolean nativeIntroPluginOwned =
-                        isPluginOwnedOpening(data, nativeIntro);
-                boolean nativeIntroManual = nativeIntro > 0 && !nativeIntroPluginOwned
-                        && (!data.manualIntroOverride
-                        || Math.abs(nativeIntro - data.introEndMs) > 1000);
-                if (nativeIntroManual) {
-                    data.introStartMs = data.introStartMs >= 0 ? data.introStartMs : 0;
-                    data.introEndMs = nativeIntro;
-                    data.autoIntro = true;
-                    data.manualIntroOverride = true;
-                    changed = true;
-                    DanmakuSpider.log("识别到原生手动片头: "
-                            + formatTime(nativeIntro));
-                } else if (!hasLocalIntro && nativeIntro <= 0
-                        && (data.introStartMs >= 0 || data.introEndMs > 0 || data.autoIntro)) {
-                    data.introStartMs = -1;
-                    data.introEndMs = -1;
-                    data.autoIntro = false;
-                    changed = true;
-                }
-                boolean hasLocalOutro = data.outroStartMs > 0
-                        && (data.autoEnding || data.manualOutroOverride);
-                boolean nativeOutroPluginOwned = isPluginOwnedEnding(
-                        data, media.durationMs, nativeHistory.ending);
-                boolean nativeOutroManual = nativeOutro > 0
-                        && !nativeOutroPluginOwned
-                        && (!data.manualOutroOverride
-                        || Math.abs(nativeOutro - data.outroStartMs) > 1000);
-                long resolvedOutro = nativeOutroManual
-                        ? (nativeOutro > 0 ? nativeOutro : -1)
-                        : (hasLocalOutro ? data.outroStartMs : -1);
-                boolean resolvedAutoEnding = resolvedOutro > 0;
-                if (data.outroStartMs != resolvedOutro) {
-                    data.outroStartMs = resolvedOutro;
-                    changed = true;
-                }
-                if (data.autoEnding != resolvedAutoEnding) {
-                    data.autoEnding = resolvedAutoEnding;
-                    changed = true;
-                }
-                if (nativeOutroManual) {
-                    if (!data.manualOutroOverride) {
-                        data.manualOutroOverride = true;
-                        changed = true;
-                    }
-                    DanmakuSpider.log("识别到原生手动片尾: "
-                            + formatTime(nativeOutro));
-                }
-                if (changed) saveData(activity, media, data);
-                if (autoEnabled) {
-                    long expectedNativeEnding =
-                            outroStartToNativeEnding(media.durationMs, data.outroStartMs);
-                    boolean nativeSynced = syncNativeHistory(activity, media, data);
-                    if (nativeHistory.ending != expectedNativeEnding && nativeSynced) {
-                        DanmakuSpider.log("修正原生片尾剩余时间: "
-                                + formatTime(nativeHistory.ending) + " -> "
-                                + formatTime(expectedNativeEnding)
-                                + "，绝对时间=" + formatTime(data.outroStartMs));
-                    }
-                } else {
-                    clearPluginOwnedNativeMarkers(
-                            activity, media, data, nativeHistory);
-                }
+            long generation = playbackGeneration;
+            MediaInfo media = getMediaInfo();
+            if (activityRef.get() != activity || generation != playbackGeneration) return;
+            if (media == null) {
+                FongMiNativeHelper.syncNativeSkipState(activity, autoEnabled);
+                return;
             }
-            if (!autoEnabled) return;
-            boolean autoIntroEnabled = data.autoIntro;
-            boolean autoEndingEnabled = data.autoEnding;
-            String mediaKey = media.key;
-            if (!TextUtils.equals(lastMediaKey, mediaKey)) {
-                lastMediaKey = mediaKey;
-                lastSkipType = "";
-                lastSkipAt = 0;
-                lastSkipAttemptAt = 0;
-                introSkipDoneForMedia = false;
+            observePlaybackSession(activity, media);
+            SkipSession session = skipSession;
+            FongMiNativeHelper.syncNativeSkipState(activity, autoEnabled);
+            lastPlaybackInfo = media;
+            long now = System.currentTimeMillis();
+            if (!TextUtils.equals(observedMediaKey, media.key)) {
+                observedMediaKey = media.key;
+                suppressAutoSkipUntil = Math.max(suppressAutoSkipUntil, now + 10000);
             }
-            if (manualBackwardJump && !inInitialPositionGrace
-                    && isManualPullbackIntoIntro(
-                    previousPositionMs, media.positionMs, data)) {
-                introSkipDoneForMedia = true;
-                DanmakuSpider.log("检测到手动拉回片头区域: "
-                        + formatTime(previousPositionMs) + " -> "
-                        + formatTime(media.positionMs)
-                        + "，本集不再自动跳过片头");
-            }
-            if (manualJump && data.outroStartMs > 0
-                    && media.positionMs >= data.outroStartMs) {
-                lastSkipType = "ending";
-            }
-
-            boolean needsAutoData = needsAutoMarkerRefresh(data)
-                    || (!data.autoIntroResolved && data.introEndMs < 0 && !data.manualIntroOverride)
-                    || (!data.autoOutroResolved && data.outroStartMs < 0 && !data.manualOutroOverride);
+            ChapterData data = loadData(activity, media);
+            if (!autoEnabled || !isAutoSkipActive(session)) return;
+            FongMiNativeHelper.HistoryState nativeHistory = FongMiNativeHelper.readHistory(activity);
+            // Native manual values stay entirely in History; they take priority on that side.
+            boolean autoIntroEnabled = data.autoIntro && nativeHistory.opening <= 0;
+            boolean autoEndingEnabled = data.autoEnding && nativeHistory.ending <= 0;
+            boolean needsAutoData = needsAutoMarkerRefresh(data, media)
+                    || (!data.autoIntroResolved && data.introEndMs < 0)
+                    || (!data.autoOutroResolved && data.outroStartMs < 0);
             if (needsAutoData) {
                 requestAutoMarkersOnce(activity, media, config);
             }
             if (now < suppressAutoSkipUntil) return;
-            if (!introSkipDoneForMedia && autoIntroEnabled
+            if (!session.introDone && autoIntroEnabled
                     && data.introStartMs >= 0 && data.introEndMs > data.introStartMs
                     && media.positionMs >= data.introStartMs && media.positionMs < data.introEndMs) {
-                if (now - lastSkipAttemptAt >= 3000
-                        && (!"intro".equals(lastSkipType) || now - lastSkipAt > 3000)) {
-                    lastSkipAttemptAt = now;
-                    if (seekTo(data.introEndMs)) {
-                        lastSkipType = "intro";
-                        lastSkipAt = now;
-                        introSkipDoneForMedia = true;
-                        DanmakuSpider.log("自动跳过片头: " + data.introStartMs + " -> " + data.introEndMs);
+                if (now - session.lastAttemptAt >= 3000) {
+                    session.lastAttemptAt = now;
+                    if (seekToAutomatically(session, data.introEndMs)) {
+                        session.introDone = true;
+                        DanmakuSpider.log("自动跳过片头（本次播放仅一次）: "
+                                + data.introStartMs + " -> " + data.introEndMs);
                     }
                 }
                 return;
             }
-            if ("intro".equals(lastSkipType)
-                    && media.positionMs > data.introEndMs + 5000) {
-                lastSkipType = "";
-            }
 
-            if (autoEndingEnabled && data.outroStartMs >= 0 && media.positionMs >= data.outroStartMs) {
-                if (!"ending".equals(lastSkipType)) {
-                    boolean handled = nextEpisode();
-                    if (!handled && media.durationMs > 0) handled = seekTo(media.durationMs);
-                    if (handled) {
-                        lastSkipType = "ending";
-                        lastSkipAt = now;
-                        DanmakuSpider.log("自动跳过片尾: " + data.outroStartMs);
-                    }
+            if (!session.outroDone && autoEndingEnabled
+                    && data.outroStartMs >= 0 && media.positionMs >= data.outroStartMs) {
+                if (now - session.lastAttemptAt < 3000 || !isAutoSkipActive(session)) return;
+                session.lastAttemptAt = now;
+                boolean handled = FongMiNativeHelper.nextEpisodeAutomatically(session);
+                if (!handled && isAutoSkipActive(session)) handled = control("next", 0);
+                if (!handled && media.durationMs > 0)
+                    handled = seekToAutomatically(session, media.durationMs);
+                if (handled) {
+                    session.outroDone = true;
+                    DanmakuSpider.log("自动跳过片尾（本次播放仅一次）: " + data.outroStartMs);
                 }
             }
         } catch (Throwable e) {
@@ -614,34 +523,46 @@ public final class ChapterManager {
         }
     }
 
-    private static boolean isManualPullbackIntoIntro(
-            long previousPositionMs, long currentPositionMs, ChapterData data) {
-        if (data == null || data.introStartMs < 0 || data.introEndMs <= data.introStartMs) {
-            return false;
-        }
-        return previousPositionMs >= data.introStartMs
-                && currentPositionMs >= data.introStartMs
-                && currentPositionMs < data.introEndMs;
+    private static boolean seekToAutomatically(SkipSession session, long positionMs) {
+        if (!isAutoSkipActive(session)) return false;
+        boolean success = FongMiNativeHelper.seekToAutomatically(session, positionMs);
+        if (!success && isAutoSkipActive(session)) success = control("seek", positionMs);
+        return success;
     }
 
     private static void applyAutoMarkers(Activity activity, MediaInfo media,
                                          AutoSkipService.Markers markers) {
-        if (activity == null || media == null || markers == null) return;
+        if (activity == null || media == null || markers == null || !isAutoSkipActive()) return;
         if (!markers.hasAny()) {
             if (!TextUtils.isEmpty(markers.error)) {
                 DanmakuSpider.log("Auto 片头查询: " + markers.error);
             }
-            return;
+            if (!markers.sourcesComplete) return;
         }
         MediaInfo current = lastPlaybackInfo;
         if (!isSamePlayback(current, media)) {
             DanmakuSpider.log("Auto 忽略过期集标记: " + media.getDisplayTitle());
             return;
         }
+        if (markers.durationMs > 0 && current.durationMs > 0
+                && Math.abs(markers.durationMs - current.durationMs) > SkipSegmentSources.DURATION_TOLERANCE_MS) return;
         ChapterData data = loadData(activity, current);
         boolean changed = false;
         boolean markersChanged = false;
-        if (markers.hasIntro() && !data.manualIntroOverride) {
+        long retryAt = markers.sourcesComplete && markers.hasAny() ? 0
+                : System.currentTimeMillis() + AUTO_QUERY_RETRY_MS;
+        if (data.markerRetryAtMs != retryAt) { data.markerRetryAtMs = retryAt; changed = true; }
+        List<Chapter> providerChapters = SkipSegmentSources.chapters(markers.segments);
+        if (!GSON.toJson(data.providerChapters).equals(GSON.toJson(providerChapters))) {
+            data.providerChapters = providerChapters;
+            changed = true;
+            markersChanged = true;
+        }
+        if (data.markerDurationMs != markers.durationMs) {
+            data.markerDurationMs = markers.durationMs;
+            changed = true;
+        }
+        if (markers.hasIntro()) {
             long introStart = Math.max(0, markers.introStartMs);
             if (data.introStartMs != introStart || data.introEndMs != markers.introEndMs
                     || !data.autoIntro) {
@@ -651,14 +572,23 @@ public final class ChapterManager {
                 changed = true;
                 markersChanged = true;
             }
+        } else if (markers.sourcesComplete && (data.introStartMs >= 0 || data.introEndMs >= 0 || data.autoIntro)) {
+            data.introStartMs = -1; data.introEndMs = -1; data.autoIntro = false;
+            changed = true; markersChanged = true;
         }
-        if (markers.hasOutro() && !data.manualOutroOverride) {
+        if (markers.hasOutro()) {
             if (data.outroStartMs != markers.outroStartMs || !data.autoEnding) {
                 data.outroStartMs = markers.outroStartMs;
                 data.autoEnding = true;
                 changed = true;
                 markersChanged = true;
             }
+        } else if ((markers.sourcesComplete || SkipSegmentSources.hasCreditsOrFollowingScene(markers))
+                && (data.outroStartMs >= 0 || data.autoEnding)) {
+            data.outroStartMs = -1;
+            data.autoEnding = false;
+            changed = true;
+            markersChanged = true;
         }
         if (markers.hasRecap()) {
             if (data.recapStartMs != markers.recapStartMs
@@ -668,12 +598,15 @@ public final class ChapterManager {
                 changed = true;
                 markersChanged = true;
             }
+        } else if (markers.sourcesComplete && (data.recapStartMs >= 0 || data.recapEndMs >= 0)) {
+            data.recapStartMs = -1; data.recapEndMs = -1;
+            changed = true; markersChanged = true;
         }
-        if (!data.manualIntroOverride && !data.autoIntroResolved) {
+        if (!data.autoIntroResolved) {
             data.autoIntroResolved = true;
             changed = true;
         }
-        if (!data.manualOutroOverride && !data.autoOutroResolved) {
+        if (!data.autoOutroResolved) {
             data.autoOutroResolved = true;
             changed = true;
         }
@@ -683,52 +616,20 @@ public final class ChapterManager {
         }
         if (!changed) return;
         saveData(activity, current, data);
-        boolean nativeWritten = syncNativeHistory(activity, current, data);
+
         if (markersChanged) {
             DanmakuSpider.log("Auto 已写入片头片尾: source=" + markers.source
                     + " intro=" + formatTime(data.introStartMs) + "->" + formatTime(data.introEndMs)
                     + " outro=" + formatTime(data.outroStartMs)
                     + " recap=" + formatTime(data.recapStartMs) + "->" + formatTime(data.recapEndMs)
-                    + " imdb=" + markers.imdbId + " native=" + nativeWritten);
+                    + " imdb=" + markers.imdbId + " native=false");
         }
     }
 
-    private static boolean syncNativeHistory(Activity activity, MediaInfo media,
-                                             ChapterData data) {
-        if (activity == null || media == null || data == null) return false;
-        FongMiNativeHelper.HistoryState nativeHistory =
-                FongMiNativeHelper.readHistory(activity);
-        boolean controlOpening = data.manualIntroOverride
-                || isPluginOwnedOpening(data, nativeHistory.opening);
-        boolean controlEnding = data.manualOutroOverride
-                || isPluginOwnedEnding(data, media.durationMs, nativeHistory.ending);
-        if (!controlOpening && !controlEnding) return false;
-        long opening = controlOpening
-                ? (data.manualIntroOverride && data.introEndMs > 0
-                ? data.introEndMs : 0)
-                : nativeHistory.opening;
-        long ending = controlEnding
-                ? (data.manualOutroOverride
-                ? outroStartToNativeEnding(media.durationMs, data.outroStartMs) : 0)
-                : nativeHistory.ending;
-        boolean written = FongMiNativeHelper.writeHistory(activity, opening, ending);
-        if (written) {
-            boolean fingerprintChanged = !data.nativeMarkerStateInitialized
-                    || data.nativeOpeningWrittenMs
-                    != (controlOpening ? opening : -1)
-                    || data.nativeEndingWrittenMs
-                    != (controlEnding ? ending : -1);
-            data.nativeMarkerStateInitialized = true;
-            data.nativeOpeningWrittenMs = controlOpening ? opening : -1;
-            data.nativeEndingWrittenMs = controlEnding ? ending : -1;
-            if (fingerprintChanged) saveData(activity, media, data);
-        }
-        return written;
-    }
-
-    private static boolean needsAutoMarkerRefresh(ChapterData data) {
-        return data != null && data.autoMarkerVersion < AUTO_MARKER_VERSION
-                && (!data.manualIntroOverride || !data.manualOutroOverride);
+    private static boolean needsAutoMarkerRefresh(ChapterData data, MediaInfo media) {
+        return data != null && (data.autoMarkerVersion < AUTO_MARKER_VERSION
+                || (media != null && media.durationMs > 0 && data.markerDurationMs <= 0)
+                || (data.markerRetryAtMs > 0 && System.currentTimeMillis() >= data.markerRetryAtMs));
     }
 
     private static void requestAutoMarkersOnce(
@@ -750,59 +651,6 @@ public final class ChapterManager {
                 lastAutoQueryAt = now;
             }
         }
-    }
-
-    private static void clearPluginOwnedNativeMarkers(
-            Activity activity, MediaInfo media, ChapterData data,
-            FongMiNativeHelper.HistoryState nativeHistory) {
-        if (activity == null || media == null || data == null
-                || nativeHistory == null || !nativeHistory.available) {
-            return;
-        }
-        boolean clearOpening = isPluginOwnedOpening(data, nativeHistory.opening);
-        boolean clearEnding = isPluginOwnedEnding(
-                data, media.durationMs, nativeHistory.ending);
-        if (!clearOpening && !clearEnding) return;
-        long opening = clearOpening ? 0 : nativeHistory.opening;
-        long ending = clearEnding ? 0 : nativeHistory.ending;
-        if (!FongMiNativeHelper.writeHistory(activity, opening, ending)) return;
-        if (clearOpening) data.nativeOpeningWrittenMs = 0;
-        if (clearEnding) data.nativeEndingWrittenMs = 0;
-        data.nativeMarkerStateInitialized = true;
-        saveData(activity, media, data);
-        DanmakuSpider.log("关闭 Auto，清除插件原生标记: opening="
-                + (clearOpening ? "是" : "否") + " ending="
-                + (clearEnding ? "是" : "否"));
-    }
-
-    private static boolean isPluginOwnedOpening(ChapterData data, long nativeOpening) {
-        if (data == null || data.manualIntroOverride || data.introEndMs <= 0) {
-            return false;
-        }
-        return nativeOpening > 0 && (nativeOpening == data.introEndMs
-                || (data.nativeMarkerStateInitialized
-                && nativeOpening == data.nativeOpeningWrittenMs));
-    }
-
-    private static boolean isPluginOwnedEnding(
-            ChapterData data, long durationMs, long nativeEnding) {
-        if (data == null || data.manualOutroOverride || data.outroStartMs <= 0) {
-            return false;
-        }
-        long expected = outroStartToNativeEnding(durationMs, data.outroStartMs);
-        return nativeEnding > 0 && expected > 0 && (nativeEnding == expected
-                || (data.nativeMarkerStateInitialized
-                && nativeEnding == data.nativeEndingWrittenMs));
-    }
-
-    private static long nativeEndingToOutroStart(long durationMs, long endingMs) {
-        if (durationMs <= 0 || endingMs <= 0 || endingMs >= durationMs) return -1;
-        return durationMs - endingMs;
-    }
-
-    private static long outroStartToNativeEnding(long durationMs, long outroStartMs) {
-        if (durationMs <= 0 || outroStartMs <= 0 || outroStartMs >= durationMs) return 0;
-        return durationMs - outroStartMs;
     }
 
     private static boolean isSamePlayback(MediaInfo current, MediaInfo target) {

@@ -6,16 +6,24 @@ import android.app.Application;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 
 import java.io.*;
 import java.lang.reflect.Field;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Init {
+
+    private static final long POST_HOME_BOOTSTRAP_DELAY_MS = 350L;
+    private static final AtomicBoolean LIFECYCLE_REGISTERED = new AtomicBoolean(false);
+    private static final AtomicBoolean BACKGROUND_STARTED = new AtomicBoolean(false);
+    private static final AtomicBoolean PLAYBACK_HOOK_REQUESTED = new AtomicBoolean(false);
 
     private final ExecutorService executor;
     final Handler handler;
@@ -39,21 +47,103 @@ public class Init {
     }
 
     public static void init(Context context) {
-        get().app = ((Application) context);
-        Proxy.init();
+        Application application = (Application) context;
+        get().app = application;
+        registerLifecycle(application);
+        DanmakuSpider.log("[启动] JAR 轻量初始化完成");
 
-        // 初始化并启动GoProxy（如果需要），并启动健康检查
-        ProxyManager.initialize(context);
+        // 兼容 JAR 在播放页热加载的情况；正常启动时不会在这里启动 Hook。
+        get().handler.postDelayed(() -> maybeStartPlaybackHook(Utils.getTopActivity()), 500);
+    }
 
-        // 删除弹幕缓存
-        DanmakuSpider.clearCache(context);
+    public static void scheduleAfterHomeBootstrap() {
+        if (!BACKGROUND_STARTED.compareAndSet(false, true)) return;
+        DanmakuSpider.log("[启动] 首页数据已返回，安排后台服务");
+        get().handler.postDelayed(Init::launchBackgroundServices,
+                POST_HOME_BOOTSTRAP_DELAY_MS);
+    }
 
-        // 初始化
-        DanmakuSpider.doInitWork(context,"");
+    public static void startBackgroundServicesNow() {
+        if (!BACKGROUND_STARTED.compareAndSet(false, true)) return;
+        DanmakuSpider.log("[启动] 内容入口已触发，立即启动后台服务");
+        get().handler.post(Init::launchBackgroundServices);
+    }
 
-        // 启动Hook监控
-        DanmakuScanner.startHookMonitor();
-        DanmakuSpider.log("Leo弹幕监控已启动");
+    private static void launchBackgroundServices() {
+        final Application application = get().app;
+        if (application == null) return;
+        execute(() -> {
+            try {
+                DanmakuSpider.clearCache(application);
+                DanmakuSpider.doInitWork(application, "");
+            } catch (Throwable e) {
+                DanmakuSpider.log("[启动] 弹幕配置初始化失败: " + e.getMessage());
+            }
+            try {
+                Proxy.init();
+                ProxyManager.initialize(application);
+            } catch (Throwable e) {
+                DanmakuSpider.log("[启动] 代理初始化失败: " + e.getMessage());
+            }
+        });
+    }
+
+    private static void registerLifecycle(Application application) {
+        if (application == null
+                || !LIFECYCLE_REGISTERED.compareAndSet(false, true)) return;
+        application.registerActivityLifecycleCallbacks(
+                new Application.ActivityLifecycleCallbacks() {
+                    @Override
+                    public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
+                        LoadingPosterController.attach(activity);
+                    }
+
+                    @Override
+                    public void onActivityStarted(Activity activity) {
+                    }
+
+                    @Override
+                    public void onActivityResumed(Activity activity) {
+                        LoadingPosterController.attach(activity);
+                        maybeStartPlaybackHook(activity);
+                    }
+
+                    @Override
+                    public void onActivityPaused(Activity activity) {
+                        LoadingPosterController.rememberSelection(activity);
+                        PlayerToolbarController.onPause(activity);
+                    }
+
+                    @Override
+                    public void onActivityStopped(Activity activity) {
+                        ChapterManager.onPlaybackStopped(activity);
+                    }
+
+                    @Override
+                    public void onActivitySaveInstanceState(Activity activity, Bundle outState) {
+                    }
+
+                    @Override
+                    public void onActivityDestroyed(Activity activity) {
+                        LoadingPosterController.release(activity);
+                        HostLoadingGuard.release(activity);
+                        ChapterManager.onPlaybackStopped(activity);
+                        PlayerToolbarController.release(activity);
+                    }
+                });
+    }
+
+    private static void maybeStartPlaybackHook(Activity activity) {
+        if (activity == null || activity.isFinishing()) return;
+        String className = activity.getClass().getName().toLowerCase(Locale.ROOT);
+        if (!DanmakuScanner.isPlayerActivity(className)) return;
+        HostLoadingGuard.attach(activity);
+        startBackgroundServicesNow();
+        if (!PLAYBACK_HOOK_REQUESTED.compareAndSet(false, true)) return;
+        get().handler.postDelayed(() -> {
+            DanmakuScanner.startHookMonitor();
+            DanmakuSpider.log("Leo弹幕监控已启动");
+        }, 250);
     }
     public static void execute(Runnable runnable) {
         get().executor.execute(runnable);
